@@ -8,8 +8,8 @@ use algo_trade::config::{
 };
 use algo_trade::engine::persistence::StatePersistenceManager;
 use algo_trade::engine::{EngineOrchestrator, PendingEntryProposal};
-use algo_trade::execution::client::ExchangeClient;
-use algo_trade::execution::mock::MockExchangeClient;
+use algo_trade::execution::client::{CandleSnapshot, ExchangeClient};
+use algo_trade::execution::mock::{MockExchangeClient, MockFillMode};
 use algo_trade::ledger::{FillRecord, FundingRecord, NewFillParams};
 use algo_trade::server::{create_router, AppState};
 use algo_trade::state::{EngineMode, PositionState};
@@ -1068,4 +1068,260 @@ fn current_time_ms_for_test() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ============================================================================
+// Milestone Regression Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_regression_ui_config_staging_and_active_mutation_rejection() {
+    let mock_client = Arc::new(MockExchangeClient::new("BTC", SignedUsd::new(dec!(100.0))));
+    let (orch, _state_file) = create_test_orchestrator(EngineConfig::normal_default(), mock_client);
+    let app = create_router(
+        Arc::new(AppState {
+            orchestrator: orch.clone(),
+        }),
+        "web",
+    );
+
+    // 1. Success: NORMAL profile with trailing stop false
+    let normal_req = serde_json::json!({
+        "profile": "NORMAL",
+        "margin_mode": "Isolated",
+        "execution_mode": "Automatic",
+        "trailing_stop": false
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/config")
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(normal_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let cfg = orch.config.read().await;
+    assert_eq!(cfg.profile.profile, TradingProfile::Normal);
+    assert!(!cfg.profile.trailing_stop_enabled);
+    drop(cfg);
+
+    // 2. Success: GREEDY profile with trailing stop true
+    let greedy_req = serde_json::json!({
+        "profile": "greedy", // test case-insensitivity
+        "margin_mode": "Cross",
+        "execution_mode": "ConfirmationRequired",
+        "trailing_stop": true
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/config")
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(greedy_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let cfg = orch.config.read().await;
+    assert_eq!(cfg.profile.profile, TradingProfile::Greedy);
+    assert!(cfg.profile.trailing_stop_enabled);
+    drop(cfg);
+
+    // 3. Error: Invalid profile name rejected with 400 Bad Request
+    let invalid_prof_req = serde_json::json!({
+        "profile": "ULTRA_RISKY",
+        "margin_mode": "Isolated",
+        "execution_mode": "Automatic"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/config")
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(invalid_prof_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Guard: Reject config mutation when trading is active (e.g. EngineMode::Running)
+    {
+        let mut sm = orch.state_machine.write().await;
+        sm.start().unwrap();
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/config")
+        .header(header::HOST, "127.0.0.1:3000")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(normal_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(res.into_body(), 10240).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot modify configuration while trading is active"));
+}
+
+#[tokio::test]
+async fn test_regression_emergency_flatten_exposure_query_and_reconciliation() {
+    let mock_client = Arc::new(MockExchangeClient::new("BTC", SignedUsd::new(dec!(100.0))));
+    let (orch, _state_file) =
+        create_test_orchestrator(EngineConfig::normal_default(), mock_client.clone());
+
+    // 1. Simulate an open position on the exchange of 0.00045 BTC
+    let btc_qty = Quantity::new(dec!(0.00045)).unwrap();
+    let entry_px = Price::new(dec!(68000.0)).unwrap();
+    mock_client
+        .set_position("BTC", btc_qty, true, Some(entry_px))
+        .await;
+    mock_client.set_fill_mode(MockFillMode::ImmediateFull).await;
+
+    // Allocate and commit margin in the capital ledger
+    {
+        let mut cap = orch.capital_ledger.write().await;
+        cap.commit_margin(SignedUsd::new(dec!(8.00))).unwrap();
+    }
+
+    // Run emergency_flatten
+    orch.emergency_flatten()
+        .await
+        .expect("Emergency flatten must succeed when exchange closes position");
+
+    // Post-conditions:
+    // a. Exchange exposure is flat (0 positions)
+    let user_state = mock_client
+        .get_user_state(&orch.target_account)
+        .await
+        .unwrap();
+    assert!(
+        user_state.positions.is_empty(),
+        "Exchange exposure must be fully flat"
+    );
+
+    // b. Internal capital ledger committed margin is released back to uncommitted
+    let cap = orch.capital_ledger.read().await;
+    assert_eq!(
+        cap.committed_margin,
+        SignedUsd::zero(),
+        "Committed margin must be released"
+    );
+
+    // c. State machine is in EmergencyShutdown and Flat
+    let sm = orch.state_machine.read().await;
+    assert!(matches!(sm.mode(), EngineMode::EmergencyShutdown(_)));
+    assert_eq!(sm.position(), &PositionState::Flat);
+    drop(sm);
+
+    // 2. Failure Case: When exchange order placement is rejected, emergency_flatten must fail
+    mock_client
+        .set_position("BTC", btc_qty, true, Some(entry_px))
+        .await;
+    mock_client.set_order_rejection(true);
+    let fail_res = orch.emergency_flatten().await;
+    assert!(
+        fail_res.is_err(),
+        "Emergency flatten must fail if close order is rejected"
+    );
+    mock_client.set_order_rejection(false);
+
+    // 3. Failure Case: When exchange position remains non-zero after close attempt, emergency_flatten must fail
+    mock_client.set_fill_mode(MockFillMode::Resting).await; // Resting orders don't immediately fill
+    let fail_remaining = orch.emergency_flatten().await;
+    assert!(
+        fail_remaining.is_err(),
+        "Emergency flatten must fail if exposure remains open on exchange"
+    );
+}
+
+#[tokio::test]
+async fn test_regression_startup_aborts_on_update_leverage_failure() {
+    let mock_client = Arc::new(MockExchangeClient::new("BTC", SignedUsd::new(dec!(100.0))));
+    let (orch, _state_file) =
+        create_test_orchestrator(EngineConfig::normal_default(), mock_client.clone());
+
+    orch.set_signer_status(algo_trade::types::SignerStatus::Active)
+        .await;
+    orch.on_mark_price_tick(
+        Price::new(dec!(68000.0)).unwrap(),
+        current_time_ms_for_test(),
+    )
+    .await;
+
+    // Simulate exchange rejection specifically during update_leverage
+    mock_client.set_leverage_failure(true);
+
+    let start_res = orch.start().await;
+    assert!(
+        start_res.is_err(),
+        "Startup must abort safely if update_leverage fails"
+    );
+    assert!(start_res
+        .unwrap_err()
+        .contains("Failed to configure leverage"));
+
+    // Invariant: Mode must remain Stopped, never Running
+    let sm = orch.state_machine.read().await;
+    assert_eq!(sm.mode(), &EngineMode::Stopped);
+}
+
+#[tokio::test]
+async fn test_regression_candle_broadcast_subscription_and_no_mark_mutation() {
+    let mock_client = Arc::new(MockExchangeClient::new("BTC", SignedUsd::new(dec!(100.0))));
+    let (orch, _state_file) =
+        create_test_orchestrator(EngineConfig::normal_default(), mock_client.clone());
+
+    // 1. Subscribe to candles
+    let mut candle_rx = orch.subscribe_candles();
+
+    // 2. Broadcast a candle snapshot
+    let test_candle = CandleSnapshot {
+        coin: "BTC".to_string(),
+        interval: "1m".to_string(),
+        open_time_ms: 1700000000000,
+        close_time_ms: 1700000060000,
+        open: Price::new(dec!(68000.0)).unwrap(),
+        high: Price::new(dec!(68500.0)).unwrap(),
+        low: Price::new(dec!(67800.0)).unwrap(),
+        close: Price::new(dec!(68200.0)).unwrap(),
+        volume: dec!(1.5),
+        trade_count: 42,
+    };
+
+    orch.on_candle_update(test_candle.clone()).await;
+
+    // 3. Subscriber receives the exact candle snapshot
+    let received = candle_rx
+        .try_recv()
+        .expect("Subscriber must receive broadcast candle");
+    assert_eq!(received.open_time_ms, test_candle.open_time_ms);
+    assert_eq!(received.open.value(), dec!(68000.0));
+    assert_eq!(received.high.value(), dec!(68500.0));
+    assert_eq!(received.low.value(), dec!(67800.0));
+    assert_eq!(received.close.value(), dec!(68200.0));
+
+    // 4. Invariant: Feeding mark price ticks must NEVER modify candle OHLC values
+    let mark_price = Price::new(dec!(72000.0)).unwrap();
+    orch.on_mark_price_tick(mark_price, current_time_ms_for_test())
+        .await;
+
+    let candles = orch.ensure_candles("1m", 10).await.unwrap();
+    if let Some(c) = candles
+        .iter()
+        .find(|c| c.open_time_ms == test_candle.open_time_ms)
+    {
+        assert_eq!(
+            c.high.value(),
+            dec!(68500.0),
+            "Mark price tick must not alter candle high"
+        );
+        assert_eq!(
+            c.close.value(),
+            dec!(68200.0),
+            "Mark price tick must not alter candle close"
+        );
+    }
 }

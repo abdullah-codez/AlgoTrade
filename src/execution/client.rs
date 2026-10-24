@@ -208,6 +208,7 @@ pub struct HyperliquidClient {
     account_address: Option<String>,
     signer: Option<HyperliquidSigner>,
     signer_status: Arc<RwLock<SignerStatus>>,
+    last_verification_ms: Arc<RwLock<Option<u64>>>,
 }
 
 impl HyperliquidClient {
@@ -227,6 +228,7 @@ impl HyperliquidClient {
             account_address: Some(account_address.to_string()),
             signer: Some(signer),
             signer_status: Arc::new(RwLock::new(SignerStatus::UnauthorizedOrExpired)),
+            last_verification_ms: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -255,10 +257,40 @@ impl HyperliquidClient {
             account_address,
             signer: None,
             signer_status: Arc::new(RwLock::new(signer_status)),
+            last_verification_ms: Arc::new(RwLock::new(None)),
         })
     }
 
+    /// Pure evaluation function to check if the agent address is listed as actively authorized.
+    ///
+    /// Requires verified matching address and strictly positive validUntil in the future (> now_ms).
+    /// Missing or malformed validUntil cannot become authorized.
+    pub fn evaluate_extra_agents_authorization(
+        data: &serde_json::Value,
+        agent_addr: &str,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(arr) = data.as_array() {
+            for entry in arr {
+                if let Some(addr) = entry["address"].as_str() {
+                    if addr.eq_ignore_ascii_case(agent_addr) {
+                        // Strictly require validUntil to be a valid integer strictly in the future (> now_ms).
+                        // Missing or malformed validUntil cannot become Active through unwrap_or(0).
+                        if let Some(valid_until) = entry["validUntil"].as_u64() {
+                            if valid_until > now_ms {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Query exchange /info to verify whether the agent wallet is actively authorized on Hyperliquid.
+    ///
+    /// Tracks verification freshness. Authorization-query failures must not allow indefinitely stale Active status.
     pub async fn verify_signer_authorization(&self) -> SignerStatus {
         let account = match self.account_address.as_deref() {
             Some(a) => a,
@@ -278,34 +310,37 @@ impl HyperliquidClient {
 
         let agent_addr = signer.wallet_address_hex();
         let payload = json!({"type": "extraAgents", "user": account});
+        let now_ms = Self::current_timestamp_ms();
+
         match self.post_info(payload).await {
             Ok(data) => {
-                let now_ms = Self::current_timestamp_ms();
-                let mut authorized = false;
-                if let Some(arr) = data.as_array() {
-                    for entry in arr {
-                        if let Some(addr) = entry["address"].as_str() {
-                            if addr.eq_ignore_ascii_case(&agent_addr) {
-                                let valid_until = entry["validUntil"].as_u64().unwrap_or(0);
-                                if valid_until == 0 || valid_until > now_ms {
-                                    authorized = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                let authorized =
+                    Self::evaluate_extra_agents_authorization(&data, &agent_addr, now_ms);
                 let status = if authorized {
                     SignerStatus::Active
                 } else {
                     SignerStatus::UnauthorizedOrExpired
                 };
                 *self.signer_status.write().await = status;
+                *self.last_verification_ms.write().await = Some(now_ms);
                 status
             }
             Err(e) => {
-                tracing::warn!("Failed to query extraAgents: {}. Preserving status.", e);
-                *self.signer_status.read().await
+                tracing::warn!("Failed to query extraAgents: {}.", e);
+                let last_ms = *self.last_verification_ms.read().await;
+                const MAX_VERIFICATION_STALENESS_MS: u64 = 60_000;
+                let is_fresh = match last_ms {
+                    Some(t) => now_ms.saturating_sub(t) <= MAX_VERIFICATION_STALENESS_MS,
+                    None => false,
+                };
+                let mut st = self.signer_status.write().await;
+                if *st == SignerStatus::Active && !is_fresh {
+                    tracing::warn!(
+                        "Signer status was Active but verification query failed and cached status is stale (>60s). Downgrading to UnauthorizedOrExpired."
+                    );
+                    *st = SignerStatus::UnauthorizedOrExpired;
+                }
+                *st
             }
         }
     }
@@ -382,53 +417,43 @@ impl HyperliquidClient {
     }
 }
 
-#[async_trait]
-impl ExchangeClient for HyperliquidClient {
-    async fn get_metadata(&self, target_coin: &str) -> Result<MarketMetadata, ExecutionError> {
-        let payload = json!({"type": "metaAndAssetCtxs"});
-        let data = self.post_info(payload).await?;
+/// Helper to strictly parse a required decimal string from a JSON value.
+/// Returns DataParsing error if field is missing or not a valid decimal string.
+/// Preserves legitimate zero values (e.g. "0", "0.0").
+pub fn parse_required_decimal(
+    parent: &serde_json::Value,
+    field_name: &str,
+) -> Result<Decimal, ExecutionError> {
+    let val_str = parent
+        .get(field_name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ExecutionError::DataParsing(format!(
+                "Missing required clearinghouse field '{}'",
+                field_name
+            ))
+        })?;
 
-        let universe = data[0]["universe"]
-            .as_array()
-            .ok_or_else(|| ExecutionError::DataParsing("Missing universe in meta".into()))?;
+    val_str.parse::<Decimal>().map_err(|e| {
+        ExecutionError::DataParsing(format!(
+            "Malformed decimal in required clearinghouse field '{}': '{}' ({})",
+            field_name, val_str, e
+        ))
+    })
+}
 
-        for coin_meta in universe {
-            if let Some(name) = coin_meta["name"].as_str() {
-                if name.eq_ignore_ascii_case(target_coin) {
-                    let sz_decimals = coin_meta["szDecimals"].as_u64().unwrap_or(5) as u32;
-                    let max_leverage = coin_meta["maxLeverage"].as_u64().unwrap_or(50) as u32;
-                    return Ok(MarketMetadata {
-                        coin: target_coin.to_string(),
-                        sz_decimals,
-                        max_leverage,
-                    });
-                }
-            }
-        }
+impl HyperliquidClient {
+    /// Pure parsing method for UserStateSummary from clearinghouseState JSON.
+    pub fn parse_user_state(data: &serde_json::Value) -> Result<UserStateSummary, ExecutionError> {
+        let margin_summary = data.get("marginSummary").ok_or_else(|| {
+            ExecutionError::DataParsing(
+                "Missing required 'marginSummary' object in clearinghouse response".into(),
+            )
+        })?;
 
-        Err(ExecutionError::DataParsing(format!(
-            "Coin {} not found in metadata",
-            target_coin
-        )))
-    }
-
-    async fn get_user_state(&self, address: &str) -> Result<UserStateSummary, ExecutionError> {
-        let payload = json!({"type": "clearinghouseState", "user": address});
-        let data = self.post_info(payload).await?;
-
-        let margin_summary = &data["marginSummary"];
-        let account_val = margin_summary["accountValue"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let margin_used = margin_summary["totalMarginUsed"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let withdrawable = data["withdrawable"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
+        let account_val = parse_required_decimal(margin_summary, "accountValue")?;
+        let margin_used = parse_required_decimal(margin_summary, "totalMarginUsed")?;
+        let withdrawable = parse_required_decimal(data, "withdrawable")?;
 
         let mut positions = Vec::new();
         if let Some(pos_arr) = data["assetPositions"].as_array() {
@@ -474,30 +499,24 @@ impl ExchangeClient for HyperliquidClient {
         })
     }
 
-    async fn get_perp_account_summary(
-        &self,
+    /// Pure parsing method for PerpAccountSummary from clearinghouseState JSON.
+    pub fn parse_clearinghouse_summary(
+        data: &serde_json::Value,
         address: &str,
+        signer_status: SignerStatus,
+        source: &str,
+        is_mock: bool,
     ) -> Result<PerpAccountSummary, ExecutionError> {
-        let payload = json!({"type": "clearinghouseState", "user": address});
-        let data = self.post_info(payload).await?;
+        let margin_summary = data.get("marginSummary").ok_or_else(|| {
+            ExecutionError::DataParsing(
+                "Missing required 'marginSummary' object in clearinghouse response".into(),
+            )
+        })?;
 
-        let margin_summary = &data["marginSummary"];
-        let account_val = margin_summary["accountValue"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let margin_used = margin_summary["totalMarginUsed"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let withdrawable = data["withdrawable"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let cross_maint = data["crossMaintenanceMarginUsed"]
-            .as_str()
-            .and_then(|s| s.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
+        let account_val = parse_required_decimal(margin_summary, "accountValue")?;
+        let margin_used = parse_required_decimal(margin_summary, "totalMarginUsed")?;
+        let withdrawable = parse_required_decimal(data, "withdrawable")?;
+        let cross_maint = parse_required_decimal(data, "crossMaintenanceMarginUsed")?;
         let time_ms = data["time"].as_u64().unwrap_or(0);
 
         let mut positions = Vec::new();
@@ -536,12 +555,6 @@ impl ExchangeClient for HyperliquidClient {
             }
         }
 
-        let signer_status = if self.signer.is_some() {
-            self.verify_signer_authorization().await
-        } else {
-            *self.signer_status.read().await
-        };
-
         Ok(PerpAccountSummary {
             account_address: address.to_string(),
             shortened_address: shorten_address(address),
@@ -552,9 +565,68 @@ impl ExchangeClient for HyperliquidClient {
             positions,
             signer_status,
             exchange_time_ms: time_ms,
-            source: "Hyperliquid Testnet".to_string(),
-            is_mock: false,
+            source: source.to_string(),
+            is_mock,
         })
+    }
+}
+
+#[async_trait]
+impl ExchangeClient for HyperliquidClient {
+    async fn get_metadata(&self, target_coin: &str) -> Result<MarketMetadata, ExecutionError> {
+        let payload = json!({"type": "metaAndAssetCtxs"});
+        let data = self.post_info(payload).await?;
+
+        let universe = data[0]["universe"]
+            .as_array()
+            .ok_or_else(|| ExecutionError::DataParsing("Missing universe in meta".into()))?;
+
+        for coin_meta in universe {
+            if let Some(name) = coin_meta["name"].as_str() {
+                if name.eq_ignore_ascii_case(target_coin) {
+                    let sz_decimals = coin_meta["szDecimals"].as_u64().unwrap_or(5) as u32;
+                    let max_leverage = coin_meta["maxLeverage"].as_u64().unwrap_or(50) as u32;
+                    return Ok(MarketMetadata {
+                        coin: target_coin.to_string(),
+                        sz_decimals,
+                        max_leverage,
+                    });
+                }
+            }
+        }
+
+        Err(ExecutionError::DataParsing(format!(
+            "Coin {} not found in metadata",
+            target_coin
+        )))
+    }
+
+    async fn get_user_state(&self, address: &str) -> Result<UserStateSummary, ExecutionError> {
+        let payload = json!({"type": "clearinghouseState", "user": address});
+        let data = self.post_info(payload).await?;
+        Self::parse_user_state(&data)
+    }
+
+    async fn get_perp_account_summary(
+        &self,
+        address: &str,
+    ) -> Result<PerpAccountSummary, ExecutionError> {
+        let payload = json!({"type": "clearinghouseState", "user": address});
+        let data = self.post_info(payload).await?;
+
+        let signer_status = if self.signer.is_some() {
+            self.verify_signer_authorization().await
+        } else {
+            *self.signer_status.read().await
+        };
+
+        Self::parse_clearinghouse_summary(
+            &data,
+            address,
+            signer_status,
+            "Hyperliquid Testnet",
+            false,
+        )
     }
 
     async fn get_candle_snapshot(

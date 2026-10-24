@@ -538,7 +538,56 @@ Following the completion and verification of Milestones 1–3, the supplementary
 3. **Signer Status Authorization Guarding**: Order placement, engine starting, and proposal approvals are strictly blocked with `403 Forbidden` unless the signer key is verified as active.
 4. **Offline Prospective Trade Preview**: Pre-trade calculations compute prospective sizing, margin requirement, round-trip fees at 0.045% benchmark taker rate, and direction-aware gross and net P&L labeled `ESTIMATE / PENDING FILL`.
 5. **Zero-Order Startup & Diagnostics**: Launching the server, querying previews, loading candles, or fetching account states executes zero orders on the exchange.
-6. **Milestone 4 Boundary Preservation**: Offline historical backtest simulation logic remains separate and locked.
+
+---
+
+## 9. Code Review Hardening & Regression Verification Package
+
+### 1. Configuration Staging Hardening
+* **Root Cause**: The frontend UI sent a flat selection payload (`{ profile: "NORMAL", margin_mode: "Isolated", execution_mode: "Automatic" }`), but the backend expected an `EngineConfig` struct containing a nested `ProfileConfig`.
+* **Fix**: Added typed request DTO `UpdateConfigRequest` in `src/server/mod.rs`.
+  - Mapped `"NORMAL"` and `"GREEDY"` selections to validated profile factory constructors (`ProfileConfig::normal()`, `ProfileConfig::greedy()`).
+  - Staged `trailing_stop` boolean flag from the UI toggle into `profile_config.trailing_stop_enabled`.
+  - Added strict guard preventing unsafe configuration mutation while trading is active (`EngineMode::Running`, `AwaitingConfirmation`, `Pausing`, or non-`Flat` positions), returning `409 Conflict`.
+  - Propagated persistence write failures as `500 Internal Server Error`.
+
+### 2. Authorization & Agent Freshness Tracking
+* **Root Cause**: In `verify_signer_authorization`, an `unwrap_or(0)` pattern on `validUntil` allowed missing, non-numeric, or `0` expiration timestamps to be treated as permanently active authorizations. Additionally, transient network failures on query could allow an indefinitely stale `Active` status.
+* **Fix**:
+  - Implemented pure function `HyperliquidClient::evaluate_extra_agents_authorization` requiring an exact agent address match and strictly `valid_until > now_ms`. Disallowed `0`, missing, or malformed fields.
+  - Added freshness tracking (`last_verification_ms` timestamp). If the extraAgents query fails and the cached verification timestamp is older than 60 seconds, status is automatically downgraded to `UnauthorizedOrExpired`.
+  - Never places dummy orders to verify authorization; verification relies strictly on the public read-only `/info` query.
+
+### 3. Sparse Candle Handling & Mark Price Separation
+* **Root Cause**:
+  1. The default `1m` timeframe frequently returned empty data on Hyperliquid Testnet because of low trade frequency within short lookback windows.
+  2. The frontend chart mutated the current candle bar's high, low, and close prices using incoming mark price ticks. Mark price is an unhedged liquidation reference, not a transaction price, violating financial separation.
+* **Fix**:
+  - In `src/engine/mod.rs`, expanded the minimum lookback window for `1m` and `5m` to 24 hours (86,400,000 ms), capturing sparse testnet trades.
+  - In `web/js/chart.js`, removed all mark price mutation of candle OHLC. Implemented a dedicated horizontal dashed mark price line (`createPriceLine`) tagged 'Mark'.
+  - Added an explicit visual glassmorphism overlay on `#tv-chart-container` displaying loading, empty, and error states.
+  - In `src/engine/mod.rs` and `src/server/mod.rs`, wired real-time `CandleSnapshot` broadcast via `subscribe_candles()` over WebSocket (`{"type": "candle_update", "candle": ...}`) and forwarded it to `onCandleSnapshot`.
+
+### 4. Robust Account Parsing & Zero-Balance Preservation
+* **Root Cause**: Clearinghouse JSON parsing silently defaulted missing or malformed required fields to zero (`0`), masking data structure mismatches.
+* **Fix**:
+  - Implemented `parse_required_decimal` in `src/execution/client.rs`.
+  - Rejects missing required clearinghouse fields (`accountValue`, `totalMarginUsed`, `withdrawable`, `crossMaintenanceMarginUsed`) or non-numeric strings with `ExecutionError::DataParsing`.
+  - Preserves legitimate zero-valued balances (`"0"`, `"0.0"`, `"0.00"`) accurately as `Decimal::ZERO` and `SignedUsd::zero()`.
+
+### 5. Execution Safety & Atomic Recovery
+* **Root Cause**:
+  1. `emergency_flatten` previously bypassed exchange interaction if the internal state machine was already `Flat`, which could orphan open positions on the exchange.
+  2. If `update_leverage` failed during startup, the engine could proceed without safe margin configuration.
+* **Fix**:
+  - `emergency_flatten` now always queries actual exchange exposure via `get_user_state(&self.target_account)`. If a position is open on the exchange, it cancels open protective orders, places a market close order, checks the placement result status, confirms post-close exchange exposure is zero, reconciles state, releases committed capital margin, and only then triggers `EmergencyShutdown`.
+  - In `src/engine/mod.rs`, if `update_leverage` fails during `start()`, startup aborts safely with an informative error, preventing transition to `EngineMode::Running`.
+
+### 6. Full Verification Results
+* `cargo fmt -- --check`: **Clean (exited with code 0)**.
+* `cargo clippy --all-targets -- -D warnings`: **0 warnings (exited with code 0)**.
+* `cargo test --all-targets`: **118 passed; 0 failed; 0 ignored; finished in 0.21s**.
+
 
 
 

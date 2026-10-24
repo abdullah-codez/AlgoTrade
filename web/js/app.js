@@ -291,6 +291,11 @@ class AlgoTradeApp {
         } else if (payload.event_type !== undefined || payload.event !== undefined) {
           // Real-time audit log event
           this.appendLogEvent(payload);
+        } else if (payload.type === 'candle_update' && payload.candle) {
+          // Real-time candlestick update
+          if (this.chart) {
+            this.chart.onCandleSnapshot(payload.candle);
+          }
         }
       } catch (err) {
         console.error('Failed to parse WebSocket message:', err);
@@ -769,12 +774,14 @@ class AlgoTradeApp {
     const profile = formData.get('profile');
     const margin_mode = formData.get('margin_mode');
     const execution_mode = formData.get('execution_mode');
+    const trailing_stop = this.trailingStopToggle ? this.trailingStopToggle.checked : false;
     const initial_seed = parseInt(this.seedInput.value, 10) || 42;
 
     const payload = {
       profile,
       margin_mode,
       execution_mode,
+      trailing_stop,
       initial_seed,
     };
 

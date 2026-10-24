@@ -13,7 +13,7 @@
 
 use algo_trade::config::{validate_account_address, validate_agent_private_key, ConfigError};
 use algo_trade::execution::client::{
-    ExchangeClient, ExecutionError, HyperliquidClient, OrderRequest, OrderTypeSpec,
+    ExchangeClient, ExecutionError, HyperliquidClient, OrderRequest, OrderTypeSpec, SignerStatus,
 };
 use algo_trade::execution::guard::{
     validate_testnet_rest_url, validate_testnet_ws_url, GuardError,
@@ -750,4 +750,201 @@ fn test_fixture_parsing_user_funding() {
     assert_eq!(delta1["coin"].as_str().unwrap(), "BTC");
     assert_eq!(delta1["usdc"].as_str().unwrap(), "-0.001250");
     assert_eq!(delta1["fundingRate"].as_str().unwrap(), "0.000100");
+}
+
+// ============================================================================
+// 10. Authorization & Agent Validation Regression Tests
+// ============================================================================
+
+#[test]
+fn test_extra_agents_authorization_evaluation_rules() {
+    let agent_addr = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    let now_ms = 1_700_000_000_000u64;
+
+    // 1. Valid matching agent with future validUntil => Authorized
+    let valid_payload = json!([
+        {
+            "address": agent_addr,
+            "validUntil": now_ms + 100_000
+        }
+    ]);
+    assert!(HyperliquidClient::evaluate_extra_agents_authorization(
+        &valid_payload,
+        agent_addr,
+        now_ms
+    ));
+
+    // 2. Missing validUntil field => Rejected (cannot become Active through default)
+    let missing_valid_until = json!([
+        {
+            "address": agent_addr
+        }
+    ]);
+    assert!(!HyperliquidClient::evaluate_extra_agents_authorization(
+        &missing_valid_until,
+        agent_addr,
+        now_ms
+    ));
+
+    // 3. validUntil == 0 => Rejected (prohibits unwrap_or(0) bypass)
+    let zero_valid_until = json!([
+        {
+            "address": agent_addr,
+            "validUntil": 0
+        }
+    ]);
+    assert!(!HyperliquidClient::evaluate_extra_agents_authorization(
+        &zero_valid_until,
+        agent_addr,
+        now_ms
+    ));
+
+    // 4. Malformed validUntil (string instead of integer) => Rejected
+    let malformed_valid_until = json!([
+        {
+            "address": agent_addr,
+            "validUntil": "never_expires"
+        }
+    ]);
+    assert!(!HyperliquidClient::evaluate_extra_agents_authorization(
+        &malformed_valid_until,
+        agent_addr,
+        now_ms
+    ));
+
+    // 5. Expired timestamp (validUntil <= now_ms) => Rejected
+    let expired_payload = json!([
+        {
+            "address": agent_addr,
+            "validUntil": now_ms - 1
+        }
+    ]);
+    assert!(!HyperliquidClient::evaluate_extra_agents_authorization(
+        &expired_payload,
+        agent_addr,
+        now_ms
+    ));
+
+    // 6. Address mismatch => Rejected
+    let different_addr_payload = json!([
+        {
+            "address": "0x2222222222222222222222222222222222222222",
+            "validUntil": now_ms + 100_000
+        }
+    ]);
+    assert!(!HyperliquidClient::evaluate_extra_agents_authorization(
+        &different_addr_payload,
+        agent_addr,
+        now_ms
+    ));
+}
+
+// ============================================================================
+// 11. Clearinghouse Parsing & Balance Preservation Regression Tests
+// ============================================================================
+
+#[test]
+fn test_clearinghouse_required_fields_parsing_and_zero_balance_preservation() {
+    // 1. Valid payload with legitimate zero balances must parse successfully with 0 values
+    let zero_balance_json = json!({
+        "marginSummary": {
+            "accountValue": "0.0",
+            "totalMarginUsed": "0.00"
+        },
+        "withdrawable": "0",
+        "crossMaintenanceMarginUsed": "0.0",
+        "time": 1700000000000u64,
+        "assetPositions": []
+    });
+
+    let summary = HyperliquidClient::parse_clearinghouse_summary(
+        &zero_balance_json,
+        TEST_ACCOUNT_ADDRESS,
+        SignerStatus::Active,
+        "Hyperliquid Testnet",
+        false,
+    )
+    .expect("Legitimate zero balance must be preserved and parse cleanly");
+
+    assert_eq!(summary.account_value, SignedUsd::zero());
+    assert_eq!(summary.total_margin_used, SignedUsd::zero());
+    assert_eq!(summary.withdrawable, SignedUsd::zero());
+    assert_eq!(summary.cross_maintenance_margin_used, SignedUsd::zero());
+
+    // 2. Missing accountValue => ExecutionError::DataParsing
+    let missing_account_val = json!({
+        "marginSummary": {
+            "totalMarginUsed": "5.0"
+        },
+        "withdrawable": "10.0",
+        "crossMaintenanceMarginUsed": "1.0",
+        "assetPositions": []
+    });
+    let err = HyperliquidClient::parse_clearinghouse_summary(
+        &missing_account_val,
+        TEST_ACCOUNT_ADDRESS,
+        SignerStatus::Active,
+        "Testnet",
+        false,
+    );
+    assert!(matches!(err, Err(ExecutionError::DataParsing(msg)) if msg.contains("accountValue")));
+
+    // 3. Missing totalMarginUsed => ExecutionError::DataParsing
+    let missing_margin_used = json!({
+        "marginSummary": {
+            "accountValue": "10.0"
+        },
+        "withdrawable": "10.0",
+        "crossMaintenanceMarginUsed": "1.0",
+        "assetPositions": []
+    });
+    let err = HyperliquidClient::parse_clearinghouse_summary(
+        &missing_margin_used,
+        TEST_ACCOUNT_ADDRESS,
+        SignerStatus::Active,
+        "Testnet",
+        false,
+    );
+    assert!(
+        matches!(err, Err(ExecutionError::DataParsing(msg)) if msg.contains("totalMarginUsed"))
+    );
+
+    // 4. Missing withdrawable => ExecutionError::DataParsing
+    let missing_withdrawable = json!({
+        "marginSummary": {
+            "accountValue": "10.0",
+            "totalMarginUsed": "0.0"
+        },
+        "crossMaintenanceMarginUsed": "1.0",
+        "assetPositions": []
+    });
+    let err = HyperliquidClient::parse_clearinghouse_summary(
+        &missing_withdrawable,
+        TEST_ACCOUNT_ADDRESS,
+        SignerStatus::Active,
+        "Testnet",
+        false,
+    );
+    assert!(matches!(err, Err(ExecutionError::DataParsing(msg)) if msg.contains("withdrawable")));
+
+    // 5. Malformed decimal string => ExecutionError::DataParsing
+    let malformed_decimal = json!({
+        "marginSummary": {
+            "accountValue": "not_a_number",
+            "totalMarginUsed": "0.0"
+        },
+        "withdrawable": "10.0",
+        "crossMaintenanceMarginUsed": "1.0",
+        "assetPositions": []
+    });
+    let err = HyperliquidClient::parse_clearinghouse_summary(
+        &malformed_decimal,
+        TEST_ACCOUNT_ADDRESS,
+        SignerStatus::Active,
+        "Testnet",
+        false,
+    );
+    assert!(
+        matches!(err, Err(ExecutionError::DataParsing(msg)) if msg.contains("Malformed decimal"))
+    );
 }

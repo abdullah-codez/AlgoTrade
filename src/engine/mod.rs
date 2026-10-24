@@ -136,6 +136,7 @@ pub struct EngineOrchestrator {
     pub last_reconciliation: Arc<RwLock<Option<ReconciliationReport>>>,
     pub stop_after_close: Arc<RwLock<bool>>,
     pub extreme_mark_price: Arc<RwLock<Option<Price>>>,
+    pub candle_tx: tokio::sync::broadcast::Sender<CandleSnapshot>,
 }
 
 fn current_time_ms() -> u64 {
@@ -163,6 +164,7 @@ impl EngineOrchestrator {
         let candle_cache = Arc::new(CandleCache::default());
         let capital_ledger = Arc::new(RwLock::new(BotCapitalLedger::default()));
         let signer_status = Arc::new(RwLock::new(SignerStatus::Active));
+        let (candle_tx, _) = tokio::sync::broadcast::channel(128);
 
         Self {
             coin,
@@ -187,7 +189,13 @@ impl EngineOrchestrator {
             last_reconciliation: Arc::new(RwLock::new(None)),
             stop_after_close: Arc::new(RwLock::new(false)),
             extreme_mark_price: Arc::new(RwLock::new(None)),
+            candle_tx,
         }
+    }
+
+    /// Subscribe to real-time candlestick update events.
+    pub fn subscribe_candles(&self) -> tokio::sync::broadcast::Receiver<CandleSnapshot> {
+        self.candle_tx.subscribe()
     }
 
     /// Load persisted state on startup.
@@ -293,21 +301,20 @@ impl EngineOrchestrator {
                 });
         }
 
-        // 3. Apply leverage and margin mode to exchange
-        if let Err(e) = self
-            .exchange_client
+        // 3. Apply leverage and margin mode to exchange. If failed, abort startup safely.
+        self.exchange_client
             .update_leverage(
                 &self.coin,
                 config.margin_mode.is_cross(),
                 config.profile.leverage,
             )
             .await
-        {
-            warn!(
-                "Notice: update_leverage returned: {}. Proceeding with start.",
-                e
-            );
-        }
+            .map_err(|e| {
+                format!(
+                    "Failed to configure leverage ({}) on exchange: {}. Aborting engine startup safely.",
+                    config.profile.leverage, e
+                )
+            })?;
 
         // 4. Transition state machine to Running
         let mut sm = self.state_machine.write().await;
@@ -370,7 +377,8 @@ impl EngineOrchestrator {
         Ok(())
     }
 
-    /// Emergency flatten: immediately market closes open position and cancels protective orders.
+    /// Emergency flatten: immediately market closes open position, confirms zero exposure on exchange,
+    /// cancels protective orders, reconciles state, and transitions local engine state.
     pub async fn emergency_flatten(&self) -> Result<(), String> {
         info!("Initiating emergency flatten protocol...");
         self.audit_logger
@@ -387,12 +395,12 @@ impl EngineOrchestrator {
         // 2. Clear pending proposal
         *self.pending_proposal.write().await = None;
 
-        // 3. Check current open position on exchange and dispatch reduce-only market close
+        // 3. Query ACTUAL exchange exposure (never trust local state alone)
         let user_state = self
             .exchange_client
             .get_user_state(&self.target_account)
             .await
-            .map_err(|e| format!("Failed to fetch user state during emergency flatten: {}", e))?;
+            .map_err(|e| format!("Emergency flatten failed to query exchange state: {}", e))?;
 
         if let Some(pos) = user_state.positions.iter().find(|p| p.coin == self.coin) {
             let pos_size = pos.szi;
@@ -413,18 +421,90 @@ impl EngineOrchestrator {
                     cloid: Some(format!("emg-close-{}", Utc::now().timestamp_millis())),
                 };
 
-                let _ = self.exchange_client.place_orders(vec![close_order]).await;
+                let place_res = self
+                    .exchange_client
+                    .place_orders(vec![close_order])
+                    .await
+                    .map_err(|e| {
+                        format!("Emergency flatten close order submission failed: {}", e)
+                    })?;
+
+                if let Some(first) = place_res.first() {
+                    if first.status.starts_with("error")
+                        || first.status.eq_ignore_ascii_case("rejected")
+                    {
+                        return Err(format!(
+                            "Emergency flatten close order rejected by exchange: {}",
+                            first.status
+                        ));
+                    }
+                }
+
+                // 4. Confirm post-execution exchange exposure (must be completely flat)
+                let post_state = self
+                    .exchange_client
+                    .get_user_state(&self.target_account)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to verify exchange state after emergency close: {}",
+                            e
+                        )
+                    })?;
+
+                if let Some(remaining) = post_state.positions.iter().find(|p| p.coin == self.coin) {
+                    if !remaining.szi.is_zero() {
+                        return Err(format!(
+                            "Emergency flatten failed: exchange exposure remains open (size: {} BTC)",
+                            remaining.szi.value()
+                        ));
+                    }
+                }
             }
         }
 
-        // 4. Transition state machine to EmergencyShutdown
+        // 5. Reconcile exchange state with internal state
+        {
+            let sm = self.state_machine.read().await;
+            match reconcile_state(
+                &*self.exchange_client,
+                &self.target_account,
+                &sm,
+                &self.coin,
+            )
+            .await
+            {
+                Ok(report) => {
+                    *self.last_reconciliation.write().await = Some(report);
+                }
+                Err(e) => {
+                    warn!("Notice during emergency flatten post-reconciliation: {}", e);
+                }
+            }
+        }
+
+        // 6. Release any committed margin on internal capital ledger
+        {
+            let mut cap = self.capital_ledger.write().await;
+            let committed = cap.committed_margin;
+            if committed.is_positive() {
+                if let Err(e) = cap.release_margin(committed) {
+                    warn!(
+                        "Notice releasing capital margin during emergency flatten: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // 7. Transition state machine to EmergencyShutdown and Flat
         let mut sm = self.state_machine.write().await;
         sm.trigger_emergency_shutdown("Manual Emergency Flatten Completed".into());
         let _ = sm.transition_to_flat();
         drop(sm);
 
         self.persist_active_state().await?;
-        info!("Emergency flatten completed.");
+        info!("Emergency flatten verified and completed successfully.");
         Ok(())
     }
 
@@ -1202,9 +1282,10 @@ impl EngineOrchestrator {
         })
     }
 
-    /// Process incoming candlestick snapshot and update multi-timeframe cache.
+    /// Process incoming candlestick snapshot, update cache, and broadcast to subscribers.
     pub async fn on_candle_update(&self, candle: CandleSnapshot) {
-        self.candle_cache.insert_candle(candle).await;
+        self.candle_cache.insert_candle(candle.clone()).await;
+        let _ = self.candle_tx.send(candle);
     }
 
     /// Ensure candles are present in cache for the given interval and limit.
@@ -1229,7 +1310,13 @@ impl EngineOrchestrator {
         };
 
         let now_ms = current_time_ms();
-        let span_ms = step_ms * (limit as u64).max(10);
+        // Look back further on lower intervals to handle sparse testnet trade volume (e.g. 24h for 1m)
+        let min_lookback_ms = match interval {
+            "1m" => 86_400_000,
+            "5m" => 86_400_000 * 3,
+            _ => 0,
+        };
+        let span_ms = (step_ms * (limit as u64).max(10)).max(min_lookback_ms);
         let start_time_ms = now_ms.saturating_sub(span_ms);
 
         let candles = self

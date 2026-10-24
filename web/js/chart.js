@@ -7,6 +7,7 @@ class BtcMarketChart {
     this.chart = null;
     this.candlestickSeries = null;
     this.volumeSeries = null;
+    this.markPriceLine = null;
     this.activeInterval = '1m';
     this.lastBars = [];
     this.currentBar = null;
@@ -19,6 +20,27 @@ class BtcMarketChart {
       this.startPolling();
     } else {
       console.warn('LightweightCharts library or container not ready yet.');
+    }
+  }
+
+  showStatusOverlay(message, type = 'info') {
+    if (!this.container) return;
+    let overlay = this.container.querySelector('.chart-status-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'chart-status-overlay';
+      this.container.appendChild(overlay);
+    }
+    overlay.textContent = message;
+    overlay.setAttribute('data-type', type);
+    overlay.style.display = 'block';
+  }
+
+  hideStatusOverlay() {
+    if (!this.container) return;
+    const overlay = this.container.querySelector('.chart-status-overlay');
+    if (overlay) {
+      overlay.style.display = 'none';
     }
   }
 
@@ -136,11 +158,16 @@ class BtcMarketChart {
   async loadTimeframe(interval) {
     try {
       const res = await fetch(`/api/candles?interval=${encodeURIComponent(interval)}&limit=300`).then((r) => r.json());
-      if (res.success && Array.isArray(res.data)) {
+      if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+        this.hideStatusOverlay();
         this.renderCandles(res.data);
+      } else {
+        const msg = res.error || `No ${interval} trade candles found on Testnet. Hyperliquid Testnet trades are sparse; try the 1h timeframe to view aggregated history.`;
+        this.showStatusOverlay(msg, 'empty');
       }
     } catch (err) {
       console.warn(`Failed to fetch candles for ${interval}:`, err);
+      this.showStatusOverlay(`Failed to load ${interval} candles: ${err.message || err}`, 'error');
     }
   }
 
@@ -201,19 +228,30 @@ class BtcMarketChart {
   }
 
   updateLiveMarkPrice(priceNum) {
-    if (!this.currentBar || isNaN(priceNum) || priceNum <= 0) return;
+    if (isNaN(priceNum) || priceNum <= 0) return;
 
-    // Update forming candle
-    const updatedBar = {
-      time: this.currentBar.time,
-      open: this.currentBar.open,
-      high: Math.max(this.currentBar.high, priceNum),
-      low: Math.min(this.currentBar.low, priceNum),
-      close: priceNum,
-    };
-
-    this.currentBar = updatedBar;
-    this.candlestickSeries.update(updatedBar);
+    // Do NOT modify trade-price candle OHLC using mark price.
+    // Instead, display mark price as a distinct, dedicated horizontal price line.
+    if (!this.markPriceLine && this.candlestickSeries) {
+      try {
+        this.markPriceLine = this.candlestickSeries.createPriceLine({
+          price: priceNum,
+          color: '#38bdf8',
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: 'Mark',
+        });
+      } catch (err) {
+        console.warn('Price line creation notice:', err);
+      }
+    } else if (this.markPriceLine) {
+      try {
+        this.markPriceLine.applyOptions({ price: priceNum });
+      } catch (err) {
+        console.warn('Price line update notice:', err);
+      }
+    }
   }
 
   onCandleSnapshot(candle) {

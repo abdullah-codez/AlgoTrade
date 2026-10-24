@@ -49,6 +49,7 @@ pub struct MockExchangeClient {
     simulate_rate_limit: Arc<AtomicBool>,
     simulate_order_rejection: Arc<AtomicBool>,
     simulate_lost_response: Arc<AtomicBool>,
+    simulate_leverage_failure: Arc<AtomicBool>,
     fill_mode: Arc<Mutex<MockFillMode>>,
     trigger_slippage_pct: Arc<Mutex<Decimal>>, // e.g. 0.10 for 10% slippage
     next_oid: Arc<AtomicU64>,
@@ -81,6 +82,7 @@ impl MockExchangeClient {
             simulate_rate_limit: Arc::new(AtomicBool::new(false)),
             simulate_order_rejection: Arc::new(AtomicBool::new(false)),
             simulate_lost_response: Arc::new(AtomicBool::new(false)),
+            simulate_leverage_failure: Arc::new(AtomicBool::new(false)),
             fill_mode: Arc::new(Mutex::new(MockFillMode::Resting)),
             trigger_slippage_pct: Arc::new(Mutex::new(dec!(0.0))),
             next_oid: Arc::new(AtomicU64::new(1000)),
@@ -106,6 +108,10 @@ impl MockExchangeClient {
 
     pub fn set_lost_response(&self, val: bool) {
         self.simulate_lost_response.store(val, Ordering::SeqCst);
+    }
+
+    pub fn set_leverage_failure(&self, val: bool) {
+        self.simulate_leverage_failure.store(val, Ordering::SeqCst);
     }
 
     pub async fn set_fill_mode(&self, mode: MockFillMode) {
@@ -373,6 +379,11 @@ impl ExchangeClient for MockExchangeClient {
         leverage: u32,
     ) -> Result<(), ExecutionError> {
         self.check_fault_injections()?;
+        if self.simulate_leverage_failure.load(Ordering::SeqCst) {
+            return Err(ExecutionError::ApiRejection(
+                "Simulated leverage update failure on exchange".to_string(),
+            ));
+        }
         let mut state = self.state.lock().await;
         state.leverage = (is_cross, leverage);
         Ok(())
@@ -450,19 +461,31 @@ impl ExchangeClient for MockExchangeClient {
                             });
                         }
                         MockFillMode::ImmediateFull => {
-                            // Update position immediately
-                            let is_long = o.is_buy;
-                            let entry_px = Some(o.limit_px);
-                            state.positions.insert(
-                                o.coin.clone(),
-                                PositionSummary {
-                                    coin: o.coin.clone(),
-                                    szi: o.size,
-                                    entry_px,
-                                    is_long,
-                                    unrealized_pnl: SignedUsd::zero(),
-                                },
-                            );
+                            if o.reduce_only {
+                                if let Some(existing) = state.positions.get_mut(&o.coin) {
+                                    if o.size.value() >= existing.szi.value() {
+                                        state.positions.remove(&o.coin);
+                                    } else {
+                                        existing.szi =
+                                            Quantity::new(existing.szi.value() - o.size.value())
+                                                .unwrap_or(Quantity::zero());
+                                    }
+                                }
+                            } else {
+                                // Update position immediately
+                                let is_long = o.is_buy;
+                                let entry_px = Some(o.limit_px);
+                                state.positions.insert(
+                                    o.coin.clone(),
+                                    PositionSummary {
+                                        coin: o.coin.clone(),
+                                        szi: o.size,
+                                        entry_px,
+                                        is_long,
+                                        unrealized_pnl: SignedUsd::zero(),
+                                    },
+                                );
+                            }
                             results.push(OrderPlacementResult {
                                 oid: Some(oid),
                                 cloid: o.cloid,

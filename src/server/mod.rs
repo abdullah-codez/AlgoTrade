@@ -3,12 +3,13 @@
 //! Never exposes private keys or credentials to the browser or logs.
 
 use crate::audit::AuditEvent;
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, ExecutionMode, MarginMode, ProfileConfig};
 use crate::engine::{EngineOrchestrator, EngineStatusSnapshot, TradePreview};
 use crate::execution::{
     validate_candle_interval, CandleSnapshot, PerpAccountSummary, SignerStatus,
 };
 use crate::ledger::{BotCapitalSummary, ReallocationDirection};
+use crate::state::EngineMode;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -23,18 +24,28 @@ use axum::{
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
 
 /// Shared state accessible by web routes.
 pub struct AppState {
     pub orchestrator: Arc<EngineOrchestrator>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConfigRequest {
+    pub profile: String,
+    pub margin_mode: String,
+    pub execution_mode: String,
+    pub trailing_stop: Option<bool>,
+    pub initial_seed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,8 +292,83 @@ async fn get_config_handler(State(state): State<Arc<AppState>>) -> Json<ApiRespo
 
 async fn update_config_handler(
     State(state): State<Arc<AppState>>,
-    Json(new_config): Json<EngineConfig>,
+    Json(payload): Json<UpdateConfigRequest>,
 ) -> (StatusCode, Json<ApiResponse<EngineConfig>>) {
+    // 1. Guard against unsafe configuration mutation while trading is active
+    {
+        let sm = state.orchestrator.state_machine.read().await;
+        let is_active = sm.mode() == &EngineMode::Running
+            || sm.mode() == &EngineMode::AwaitingConfirmation
+            || sm.mode() == &EngineMode::Pausing
+            || sm.position() != &crate::state::PositionState::Flat;
+        if is_active {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::err(
+                    "Cannot modify configuration while trading is active. Stop trading first.",
+                )),
+            );
+        }
+    }
+
+    // 2. Map profile string to validated profile factory
+    let mut profile_config = match payload.profile.trim().to_uppercase().as_str() {
+        "NORMAL" => ProfileConfig::normal(),
+        "GREEDY" => ProfileConfig::greedy(),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!(
+                    "Invalid strategy profile '{}'. Must be 'NORMAL' or 'GREEDY'.",
+                    other
+                ))),
+            );
+        }
+    };
+
+    // 3. Apply trailing stop setting if provided
+    if let Some(trailing_stop) = payload.trailing_stop {
+        profile_config.trailing_stop_enabled = trailing_stop;
+    }
+
+    // 4. Map margin mode
+    let margin_mode = match payload.margin_mode.trim().to_uppercase().as_str() {
+        "ISOLATED" => MarginMode::Isolated,
+        "CROSS" => MarginMode::Cross,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!(
+                    "Invalid margin mode '{}'. Must be 'Isolated' or 'Cross'.",
+                    other
+                ))),
+            );
+        }
+    };
+
+    // 5. Map execution mode
+    let execution_mode = match payload.execution_mode.trim().to_uppercase().as_str() {
+        "AUTOMATIC" => ExecutionMode::Automatic,
+        "CONFIRMATIONREQUIRED" | "CONFIRMATION" => ExecutionMode::ConfirmationRequired,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!(
+                    "Invalid execution mode '{}'. Must be 'Automatic' or 'ConfirmationRequired'.",
+                    other
+                ))),
+            );
+        }
+    };
+
+    // 6. Build and validate engine configuration
+    let new_config = EngineConfig {
+        profile: profile_config,
+        margin_mode,
+        execution_mode,
+        initial_seed: payload.initial_seed,
+    };
+
     if let Err(e) = new_config.validate() {
         return (
             StatusCode::BAD_REQUEST,
@@ -290,8 +376,18 @@ async fn update_config_handler(
         );
     }
 
+    // 7. Apply configuration and propagate persistence failures
     *state.orchestrator.config.write().await = new_config.clone();
-    let _ = state.orchestrator.persist_active_state().await;
+    if let Err(e) = state.orchestrator.persist_active_state().await {
+        error!("Failed to persist updated configuration: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::err(format!(
+                "Failed to persist configuration to disk: {}",
+                e
+            ))),
+        );
+    }
 
     info!("Updated engine configuration via web dashboard.");
     (StatusCode::OK, Json(ApiResponse::ok(new_config)))
@@ -346,25 +442,12 @@ async fn control_stop_handler(
 async fn control_emergency_flatten_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
-    let sm = state.orchestrator.state_machine.read().await;
-    let is_flat = matches!(sm.position(), crate::state::PositionState::Flat);
-    drop(sm);
-
-    if is_flat {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::ok(
-                "Position is already Flat; no emergency orders needed.".into(),
-            )),
-        );
-    }
-
     let signer_st = *state.orchestrator.signer_status.read().await;
     if signer_st != SignerStatus::Active {
         return (
             StatusCode::FORBIDDEN,
             Json(ApiResponse::err(format!(
-                "Cannot execute emergency flatten on open position: agent signer is not active (status: {:?}).",
+                "Cannot execute emergency flatten: agent signer is not active (status: {:?}).",
                 signer_st
             ))),
         );
@@ -373,7 +456,9 @@ async fn control_emergency_flatten_handler(
     match state.orchestrator.emergency_flatten().await {
         Ok(()) => (
             StatusCode::OK,
-            Json(ApiResponse::ok("Emergency flatten completed".into())),
+            Json(ApiResponse::ok(
+                "Emergency flatten completed and verified flat on exchange".into(),
+            )),
         ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))),
     }
@@ -453,6 +538,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 
 async fn handle_ws_stream(mut socket: WebSocket, state: Arc<AppState>) {
     let mut audit_rx = state.orchestrator.audit_logger.subscribe();
+    let mut candle_rx = state.orchestrator.subscribe_candles();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
@@ -474,7 +560,19 @@ async fn handle_ws_stream(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                 }
             }
-            // 3. Handle messages from client (pings, disconnects)
+            // 3. Push real-time candle update events as they occur
+            Ok(candle) = candle_rx.recv() => {
+                let msg = json!({
+                    "type": "candle_update",
+                    "candle": candle,
+                });
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // 4. Handle messages from client (pings, disconnects)
             msg = socket.next() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
