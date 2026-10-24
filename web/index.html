@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AlgoTrade — BTC Perpetual Trading Engine</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Navigation & Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo-icon">⚡</div>
+        <div class="brand-text">
+          <h1>AlgoTrade</h1>
+          <span class="subtitle">Hyperliquid BTC Perp Trading Engine</span>
+        </div>
+      </div>
+
+      <!-- Real-time Status Badges -->
+      <div class="header-status">
+        <div class="status-pill" id="account-pill" title="Target Hyperliquid Testnet Account">
+          <span class="badge-label">Account</span>
+          <span class="badge-value font-mono text-accent" id="account-address-badge">--</span>
+        </div>
+        <div class="status-pill" id="signer-pill" title="EIP-712 Agent Signer Authorization Status">
+          <span class="badge-label">Signer</span>
+          <span class="badge-value" id="signer-status-badge">Checking...</span>
+        </div>
+        <div class="status-pill" id="ws-status-pill">
+          <span class="status-dot disconnected"></span>
+          <span id="ws-status-text">Connecting...</span>
+        </div>
+        <div class="status-pill mode-pill">
+          <span class="badge-label">Mode</span>
+          <span class="badge-value stopped" id="engine-mode-badge">STOPPED</span>
+        </div>
+        <div class="status-pill profile-pill">
+          <span class="badge-label">Profile</span>
+          <span class="badge-value text-accent" id="active-profile-badge">NORMAL</span>
+        </div>
+        <div class="status-pill margin-pill">
+          <span class="badge-label">Margin</span>
+          <span class="badge-value" id="active-margin-badge">ISOLATED</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs-nav">
+      <button class="tab-btn active" data-tab="cockpit-view">
+        <span class="tab-icon">🎛️</span> Live Cockpit &amp; Controls
+      </button>
+      <button class="tab-btn" data-tab="history-view">
+        <span class="tab-icon">📜</span> Activity &amp; Audit Log
+      </button>
+      <button class="tab-btn" data-tab="backtest-view">
+        <span class="tab-icon">🧪</span> Backtest &amp; Evaluation <span class="tab-tag">M4 Preview</span>
+      </button>
+    </nav>
+
+    <!-- Global Notification & Warning Banners -->
+    <div id="alerts-container">
+      <!-- Signer Status Warning Banner -->
+      <div id="signer-warning-banner" class="alert-banner warning hidden">
+        <div class="alert-icon">🔒</div>
+        <div class="alert-content">
+          <div class="alert-title" id="signer-warning-title">Agent Signer Inactive — Order Placement Disabled</div>
+          <div class="alert-desc" id="signer-warning-text">
+            Trading actions are gated: the configured agent private key is unauthorized, read-only, or expired.
+            Hyperliquid agent wallet authorizations have an intended 30-day lifecycle and must be renewed when expired.
+            Configure an active agent key to start autonomous trading or approve staged proposals.
+          </div>
+        </div>
+      </div>
+
+      <!-- Exchange State Discrepancy Banner -->
+      <div id="discrepancy-banner" class="alert-banner danger hidden">
+        <div class="alert-icon">⚠️</div>
+        <div class="alert-content">
+          <div class="alert-title">Exchange State Discrepancy Detected</div>
+          <div class="alert-desc" id="discrepancy-details">Awaiting state reconciler pass...</div>
+        </div>
+      </div>
+
+      <!-- Pending Entry Proposal Banner (Confirmation Mode) -->
+      <div id="proposal-banner" class="alert-banner confirmation hidden">
+        <div class="alert-icon">🔔</div>
+        <div class="alert-content">
+          <div class="alert-title">Pending Entry Proposal — User Confirmation Required</div>
+          <div class="proposal-details">
+            <span class="prop-item">Direction: <strong id="prop-direction">LONG</strong></span>
+            <span class="prop-item">Price: <strong id="prop-price">$0.00</strong></span>
+            <span class="prop-item">Size: <strong id="prop-size">0.0000 BTC</strong></span>
+            <span class="prop-item">Notional: <strong id="prop-notional">$0.00</strong></span>
+            <span class="prop-item">TP: <strong id="prop-tp">$0.00</strong></span>
+            <span class="prop-item">SL: <strong id="prop-sl">$0.00</strong></span>
+            <span class="prop-item countdown">Expires in: <strong id="prop-timer">60s</strong></span>
+          </div>
+          <div class="proposal-actions">
+            <button id="btn-approve-proposal" class="btn btn-sm btn-success">✓ Approve &amp; Execute</button>
+            <button id="btn-reject-proposal" class="btn btn-sm btn-outline-danger">✕ Reject</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Content Area -->
+    <main class="app-main">
+      <!-- TAB 1: LIVE COCKPIT & CONTROLS (PANELS 1 TO 5) -->
+      <section id="cockpit-view" class="view-panel active">
+        <!-- TOP ROW: PANELS 1 & 2 -->
+        <div class="grid-layout grid-2-col">
+          <!-- PANEL 1: ACCOUNT OVERVIEW (HYPERLIQUID PERPETUALS) -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h2>1. Account Overview</h2>
+                <span class="card-caption">Hyperliquid Testnet Perpetual Clearinghouse</span>
+              </div>
+              <span class="badge-tag" id="acc-signer-badge">Signer Active</span>
+            </div>
+
+            <div class="metrics-subgrid">
+              <div class="stat-box">
+                <span class="stat-label">Perpetual Equity</span>
+                <span class="stat-value font-mono text-accent" id="acc-equity">$0.00 USDC</span>
+                <span class="stat-sub">Total account value</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Withdrawable Collateral</span>
+                <span class="stat-value font-mono text-success" id="acc-withdrawable">$0.00 USDC</span>
+                <span class="stat-sub">Available margin buffer</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Exchange Margin Used</span>
+                <span class="stat-value font-mono" id="acc-margin-used">$0.00 USDC</span>
+                <span class="stat-sub">Committed on exchange</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Exchange Open Pos. P&amp;L</span>
+                <span class="stat-value font-mono" id="acc-unrealized-pnl">$0.00 USDC</span>
+                <span class="stat-sub" id="acc-open-pos-desc">No open position</span>
+              </div>
+            </div>
+
+            <div class="account-footer-meta">
+              <div class="meta-row">
+                <span class="meta-label">Target Account:</span>
+                <span class="meta-value font-mono" id="acc-full-address">--</span>
+              </div>
+              <div class="meta-row">
+                <span class="meta-label">Market Feed Latency:</span>
+                <span class="meta-value" id="perf-feed-latency">
+                  <span class="dot-indicator green"></span>
+                  <span id="perf-feed-status">Checking latency...</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL 2: BOT CAPITAL LEDGER -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h2>2. Bot Capital Ledger</h2>
+                <span class="card-caption">Deterministic Internal Allocation ($10 Invariant Budget)</span>
+              </div>
+              <span class="badge-tag info">Fixed $10 Budget</span>
+            </div>
+
+            <div class="metrics-subgrid">
+              <div class="stat-box">
+                <span class="stat-label">Allocated Trading</span>
+                <span class="stat-value font-mono text-accent" id="cap-allocated-trading">$8.00 USDC</span>
+                <span class="stat-sub">Max cap: $8.00 USDC</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Buffer Reserve</span>
+                <span class="stat-value font-mono text-success" id="cap-reserve">$2.00 USDC</span>
+                <span class="stat-sub">Min target: $2.00 USDC</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Committed Margin</span>
+                <span class="stat-value font-mono" id="cap-committed-margin">$0.00 USDC</span>
+                <span class="stat-sub">Tied to active position</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Uncommitted Trading</span>
+                <span class="stat-value font-mono" id="cap-uncommitted">$8.00 USDC</span>
+                <span class="stat-sub">Available for new trades</span>
+              </div>
+            </div>
+
+            <!-- Bot Realized Performance Summary -->
+            <div class="capital-pnl-strip">
+              <div class="pnl-strip-item">
+                <span class="strip-label">Bot Realized Net P&amp;L:</span>
+                <span class="strip-value font-mono" id="cap-realized-net">$0.00</span>
+              </div>
+              <div class="pnl-strip-item">
+                <span class="strip-label">Fees Paid:</span>
+                <span class="strip-value font-mono text-danger" id="cap-fees-paid">-$0.00</span>
+              </div>
+              <div class="pnl-strip-item">
+                <span class="strip-label">Net Funding:</span>
+                <span class="strip-value font-mono" id="cap-net-funding">$0.00</span>
+              </div>
+            </div>
+
+            <!-- Capital Reallocation Controls -->
+            <div class="reallocation-box">
+              <div class="realloc-header">
+                <span class="realloc-title">Reallocate Strategy Capital</span>
+                <span class="realloc-hint">Preserves $10 total budget ($8 trading cap)</span>
+              </div>
+              <div class="realloc-actions">
+                <div class="input-prefix-group">
+                  <span class="input-currency">$</span>
+                  <input type="number" id="input-realloc-amount" class="input-field-sm" value="1.00" min="0.01" max="8.00" step="0.50">
+                </div>
+                <button type="button" id="btn-realloc-to-reserve" class="btn btn-sm btn-secondary">
+                  Transfer to Reserve →
+                </button>
+                <button type="button" id="btn-realloc-to-trading" class="btn btn-sm btn-secondary">
+                  ← Transfer to Trading
+                </button>
+              </div>
+              <div id="realloc-feedback" class="feedback-msg hidden"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- MIDDLE ROW: PANELS 3 & 4 -->
+        <div class="grid-layout grid-2-col mt-4">
+          <!-- PANEL 3: LIVE BTC MARKET (LIGHTWEIGHT CHARTS) -->
+          <div class="glass-card chart-card">
+            <div class="card-header chart-header">
+              <div class="chart-title-block">
+                <h2>3. Live BTC Perpetual Market</h2>
+                <div class="price-display">
+                  <span class="price-label">Mark Price:</span>
+                  <span class="price-value font-mono" id="perf-mark-price">$0.00</span>
+                  <span class="live-dot pulse"></span>
+                </div>
+              </div>
+
+              <!-- Timeframe Selector Buttons -->
+              <div class="timeframe-selector">
+                <button type="button" class="tf-btn active" data-interval="1m">1m</button>
+                <button type="button" class="tf-btn" data-interval="5m">5m</button>
+                <button type="button" class="tf-btn" data-interval="15m">15m</button>
+                <button type="button" class="tf-btn" data-interval="1h">1h</button>
+              </div>
+            </div>
+
+            <!-- Candlestick Chart Mount Point -->
+            <div id="tv-chart-container" class="chart-container"></div>
+            <div class="chart-caption">
+              Candlestick chart powered by TradingView Lightweight Charts™ under Apache License 2.0
+            </div>
+          </div>
+
+          <!-- PANEL 4: CURRENT POSITION AND PROTECTION -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h2>4. Current Position &amp; Protection</h2>
+                <span class="card-caption">Exchange-side Continuous Reduce-Only Triggers</span>
+              </div>
+              <span class="badge-value" id="pos-direction-pill">FLAT</span>
+            </div>
+
+            <div class="metrics-subgrid">
+              <div class="stat-box">
+                <span class="stat-label">Position State</span>
+                <span class="stat-value font-mono" id="perf-pos-state">FLAT</span>
+                <span class="stat-sub" id="perf-pos-details">Size: 0.0000 BTC</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Unrealized Gross P&amp;L</span>
+                <span class="stat-value font-mono" id="perf-unrealized-pnl">$0.00</span>
+                <span class="stat-sub">Direction-aware MTM</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Session Realized Net P&amp;L</span>
+                <span class="stat-value font-mono" id="perf-net-pnl">$0.00</span>
+                <span class="stat-sub" id="perf-net-breakdown">Fees: $0.00 | Funding: $0.00</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Loss Streak Tracker</span>
+                <span class="stat-value" id="perf-loss-streak">0 / 3</span>
+                <span class="stat-sub" id="perf-target-progress">Target: $0.00 / $0.70</span>
+              </div>
+            </div>
+
+            <!-- Protective Trigger Orders Card -->
+            <div class="protection-status-card">
+              <div class="prot-header">
+                <span class="prot-title">Exchange-Side Reduce-Only Trigger Orders</span>
+                <span class="badge-tag success" id="perf-active-orders">None</span>
+              </div>
+              <div class="prot-orders-grid">
+                <div class="prot-order-item">
+                  <span class="order-type-label text-success">Take-Profit (TP):</span>
+                  <span class="order-id-val font-mono" id="perf-active-tp">None</span>
+                </div>
+                <div class="prot-order-item">
+                  <span class="order-type-label text-danger">Stop-Loss (SL):</span>
+                  <span class="order-id-val font-mono" id="perf-active-sl">None</span>
+                </div>
+              </div>
+              <div class="prot-notice" id="perf-protection-status">
+                When open, positions are strictly backed by resting reduce-only stop triggers.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- BOTTOM ROW: PANEL 5 (STRATEGY & RISK SETTINGS + TRADE PREVIEW + CONTROLS) -->
+        <div class="glass-card mt-4">
+          <div class="card-header">
+            <div class="header-title-group">
+              <h2>5. Strategy &amp; Risk Settings</h2>
+              <span class="card-caption">Deterministic Profile Parameters, Pre-Trade Preview &amp; Lifecycle Controls</span>
+            </div>
+            <span class="badge-tag accent">Pre-Flight Validated</span>
+          </div>
+
+          <div class="grid-layout grid-3-col">
+            <!-- Col 1: Config Form -->
+            <form id="config-form" class="config-form">
+              <!-- Strategy Profile -->
+              <div class="form-group">
+                <label class="form-label">Strategy Profile</label>
+                <div class="radio-pill-group">
+                  <label class="radio-pill">
+                    <input type="radio" name="profile" value="NORMAL" checked>
+                    <div class="pill-card">
+                      <div class="pill-title">NORMAL</div>
+                      <div class="pill-desc">5x Lev | $8 Cap | 1.0% TP | 0.5% SL | $0.70 Target</div>
+                    </div>
+                  </label>
+                  <label class="radio-pill">
+                    <input type="radio" name="profile" value="GREEDY">
+                    <div class="pill-card">
+                      <div class="pill-title">GREEDY</div>
+                      <div class="pill-desc">10x Lev | $8 Cap | 1.5% TP | 0.75% SL | $2.00 Target</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Margin Mode Selection (Independent) -->
+              <div class="form-group">
+                <label class="form-label">Margin Mode (Independent)</label>
+                <div class="radio-pill-group">
+                  <label class="radio-pill">
+                    <input type="radio" name="margin_mode" value="Isolated" checked>
+                    <div class="pill-card">
+                      <div class="pill-title">ISOLATED</div>
+                      <div class="pill-desc">Risk strictly capped to allocated margin</div>
+                    </div>
+                  </label>
+                  <label class="radio-pill">
+                    <input type="radio" name="margin_mode" value="Cross">
+                    <div class="pill-card">
+                      <div class="pill-title">CROSS</div>
+                      <div class="pill-desc">Shared account collateral supports position</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Execution Mode -->
+              <div class="form-group">
+                <label class="form-label">Execution Mode</label>
+                <div class="radio-pill-group">
+                  <label class="radio-pill">
+                    <input type="radio" name="execution_mode" value="Automatic" checked>
+                    <div class="pill-card">
+                      <div class="pill-title">AUTOMATIC</div>
+                      <div class="pill-desc">Autonomous trade execution</div>
+                    </div>
+                  </label>
+                  <label class="radio-pill">
+                    <input type="radio" name="execution_mode" value="ConfirmationRequired">
+                    <div class="pill-card">
+                      <div class="pill-title">CONFIRMATION</div>
+                      <div class="pill-desc">Requires user click to execute</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Trailing Stop -->
+              <div class="form-group">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="trailing-stop-toggle" name="trailing_stop">
+                  <span class="checkbox-custom"></span>
+                  <div class="checkbox-text">
+                    <div class="cb-title">Bot-Managed Trailing Stop</div>
+                    <div class="cb-desc">Activates at 1.0% profit, trails 0.4% from peak</div>
+                  </div>
+                </label>
+              </div>
+
+              <!-- Deterministic Seed -->
+              <div class="form-group">
+                <label class="form-label" for="seed-input">Deterministic Initial Seed</label>
+                <div class="input-with-button">
+                  <input type="number" id="seed-input" class="input-field" value="42" min="1" max="999999">
+                  <button type="button" id="btn-random-seed" class="btn btn-secondary btn-sm">Reroll</button>
+                </div>
+              </div>
+
+              <button type="submit" id="btn-save-config" class="btn btn-primary w-full">Stage &amp; Validate Configuration</button>
+            </form>
+
+            <!-- Col 2: Prospective Trade Preview Card -->
+            <div class="preview-panel">
+              <div class="preview-card-header">
+                <h3>Prospective Trade Preview</h3>
+                <span class="badge-tag preview-badge">ESTIMATE / PENDING FILL</span>
+              </div>
+              <p class="preview-explainer">Hand-calculated projection based on current BTC mark price &amp; 0.045% benchmark taker fees.</p>
+
+              <div class="preview-specs-grid" id="preview-specs">
+                <div class="spec-row">
+                  <span class="spec-label">Profile &amp; Direction:</span>
+                  <span class="spec-value font-mono" id="prev-profile-dir">NORMAL • LONG</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Est. Entry Price:</span>
+                  <span class="spec-value font-mono" id="prev-entry-px">$0.00</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Order Size:</span>
+                  <span class="spec-value font-mono" id="prev-size-notional">0.0000 BTC ($0.00)</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Margin Required:</span>
+                  <span class="spec-value font-mono text-accent" id="prev-margin-req">$0.00 USDC</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Take-Profit Price:</span>
+                  <span class="spec-value font-mono text-success" id="prev-tp-px">$0.00 (+1.0%)</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Stop-Loss Price:</span>
+                  <span class="spec-value font-mono text-danger" id="prev-sl-px">$0.00 (-0.5%)</span>
+                </div>
+                <div class="spec-row">
+                  <span class="spec-label">Est. Round-Trip Fees:</span>
+                  <span class="spec-value font-mono text-danger" id="prev-fees-est">-$0.00</span>
+                </div>
+                <div class="spec-row highlight-success">
+                  <span class="spec-label">Est. Net TP Profit:</span>
+                  <span class="spec-value font-mono text-success" id="prev-net-tp">+$0.00</span>
+                </div>
+                <div class="spec-row highlight-danger">
+                  <span class="spec-label">Est. Net SL Loss:</span>
+                  <span class="spec-value font-mono text-danger" id="prev-net-sl">-$0.00</span>
+                </div>
+              </div>
+
+              <button type="button" id="btn-refresh-preview" class="btn btn-secondary btn-sm w-full mt-2">
+                ↻ Refresh Preview
+              </button>
+            </div>
+
+            <!-- Col 3: Lifecycle Controls & Invariants -->
+            <div class="controls-panel">
+              <div class="controls-header">
+                <h3>Lifecycle Controls</h3>
+                <span class="card-caption">Engine boots Stopped. Explicit start required.</span>
+              </div>
+
+              <div class="control-buttons-stack">
+                <!-- START -->
+                <button id="btn-control-start" class="btn btn-success btn-lg">
+                  <span class="btn-icon">▶</span>
+                  <div class="btn-text-block">
+                    <strong>START ENGINE</strong>
+                    <span>Validates pre-flight &amp; activates trading</span>
+                  </div>
+                </button>
+
+                <!-- PAUSE -->
+                <button id="btn-control-pause" class="btn btn-warning btn-lg">
+                  <span class="btn-icon">⏸</span>
+                  <div class="btn-text-block">
+                    <strong>PAUSE NEW ENTRIES</strong>
+                    <span>Suspends new trades, maintains open stops</span>
+                  </div>
+                </button>
+
+                <!-- STOP -->
+                <button id="btn-control-stop" class="btn btn-secondary btn-lg">
+                  <span class="btn-icon">⏹</span>
+                  <div class="btn-text-block">
+                    <strong>STOP STRATEGY</strong>
+                    <span>Graceful stop after current position exits</span>
+                  </div>
+                </button>
+
+                <!-- EMERGENCY FLATTEN -->
+                <button id="btn-control-flatten" class="btn btn-danger btn-lg">
+                  <span class="btn-icon">🚨</span>
+                  <div class="btn-text-block">
+                    <strong>EMERGENCY FLATTEN</strong>
+                    <span>Market closes position &amp; halts immediately</span>
+                  </div>
+                </button>
+              </div>
+
+              <!-- Safety Invariants Summary -->
+              <div class="invariants-compact-list">
+                <div class="inv-item"><span>Budget Cap:</span> <strong>$10.00 USDC</strong></div>
+                <div class="inv-item"><span>Trade Margin Cap:</span> <strong>$8.00 USDC</strong></div>
+                <div class="inv-item"><span>Reserve Target:</span> <strong>$2.00 USDC</strong></div>
+                <div class="inv-item"><span>Min Notional:</span> <strong>$10.00 USDC</strong></div>
+                <div class="inv-item"><span>Hard Loss Trigger:</span> <strong>-$2.00 USDC</strong></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: ACTIVITY & AUDIT LOG (PANEL 6) -->
+      <section id="history-view" class="view-panel">
+        <div class="grid-layout grid-2-col">
+          <!-- PANEL 6A: CLOSED TRADES LEDGER -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h2>6. Closed Trade History</h2>
+                <span class="card-caption">FIFO Matched Fills Ledger with Direction-Aware Math</span>
+              </div>
+              <span class="badge-tag">Matched Fills</span>
+            </div>
+            <div class="table-container">
+              <table class="data-table" id="trades-table">
+                <thead>
+                  <tr>
+                    <th>Direction</th>
+                    <th>Entry Px</th>
+                    <th>Exit Px</th>
+                    <th>Size</th>
+                    <th>Gross P&amp;L</th>
+                    <th>Fees</th>
+                    <th>Net P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody id="trades-tbody">
+                  <tr>
+                    <td colspan="7" class="text-center empty-state">No closed trades recorded in current session</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- PANEL 6B: APPEND-ONLY AUDIT STREAM -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h2>Real-Time Audit Stream</h2>
+                <span class="card-caption">Structured JSONL Security Telemetry</span>
+              </div>
+              <span class="badge-tag success">Live Stream</span>
+            </div>
+            <div class="terminal-container" id="audit-log-terminal">
+              <div class="log-entry system">[SYSTEM] Audit stream connected to WebSocket telemetry.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: BACKTESTING & EVALUATION (M4 PREVIEW) -->
+      <section id="backtest-view" class="view-panel">
+        <div class="glass-card max-w-4xl mx-auto">
+          <div class="card-header">
+            <h2>Backtesting &amp; Strategy Evaluation (Milestone 4 Preview)</h2>
+            <span class="card-tag">Milestone 4 Scope — Locked</span>
+          </div>
+
+          <div class="preview-content">
+            <div class="preview-hero">
+              <div class="preview-icon">🧪</div>
+              <h3>Historical Simulation &amp; Evaluation Engine</h3>
+              <p>Milestone 4 introduces offline historical candle replay with intra-bar execution, strict isolation from live orders, and out-of-sample statistical validation.</p>
+            </div>
+
+            <div class="preview-features-grid">
+              <div class="feature-item">
+                <div class="feature-title">Binance USDⓈ-M 1m Replay</div>
+                <div class="feature-desc">Replay true historical BTCUSDT perp 1-minute OHLCV candles with realistic taker fees and gap handling.</div>
+              </div>
+              <div class="feature-item">
+                <div class="feature-title">Historical Funding Integration</div>
+                <div class="feature-desc">Applies 8-hour timestamped Hyperliquid funding rates directly to open lots during backtest windows.</div>
+              </div>
+              <div class="feature-item">
+                <div class="feature-title">Strict Order Path Isolation</div>
+                <div class="feature-desc">Offline execution runs 100% locally with zero exchange connectivity and cannot touch live testnet funds.</div>
+              </div>
+              <div class="feature-item">
+                <div class="feature-title">Normal vs Greedy Benchmarks</div>
+                <div class="feature-desc">Comparative metrics: Sharpe ratio, profit factor, max drawdown, win rate, and net P&amp;L.</div>
+              </div>
+            </div>
+
+            <div class="alert-banner info mt-4">
+              <div class="alert-icon">ℹ️</div>
+              <div class="alert-content">
+                <div class="alert-title">Milestone 4 Scope Preservation Notice</div>
+                <div class="alert-desc">Backtesting engine logic is intentionally excluded from Milestone 3 per architecture specifications. It will be fully implemented and validated in Milestone 4 upon user authorization.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Emergency Flatten Confirmation Modal -->
+    <div id="flatten-modal" class="modal-backdrop hidden">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>Confirm Emergency Flatten</h3>
+          <button id="btn-close-modal" class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="text-danger font-semibold">⚠️ WARNING: This will immediately dispatch a reduce-only market order to close any open BTC position and halt the trading engine.</p>
+          <p>Active protective TP/SL triggers will be cancelled. This action cannot be undone.</p>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-confirm-flatten" class="btn btn-danger">Confirm Emergency Flatten</button>
+          <button id="btn-cancel-flatten" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- App Footer -->
+    <footer class="app-footer">
+      <div class="footer-content">
+        <div class="footer-left">
+          <span>AlgoTrade BTC Perpetual Trading Bot</span>
+          <span class="footer-divider">•</span>
+          <span>127.0.0.1 Loopback Only</span>
+          <span class="footer-divider">•</span>
+          <span>Hyperliquid Testnet</span>
+        </div>
+        <div class="footer-right">
+          <span>Candlestick chart powered by <strong>TradingView Lightweight Charts™</strong> under Apache License 2.0</span>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Vendors & Scripts -->
+  <script src="js/lightweight-charts.standalone.production.js"></script>
+  <script src="js/chart.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
