@@ -1,0 +1,26 @@
+# Cargo build artifacts
+/target/
+Cargo.lock
+
+# Environment and secrets
+.env
+*.env
+*.pem
+*.key
+
+# Application runtime state and logs
+session_state.json
+session_state.json.tmp
+events.jsonl
+*.log
+*.tmp
+test_session_state_*.json
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+
+# Added by cargo
+
+/target
