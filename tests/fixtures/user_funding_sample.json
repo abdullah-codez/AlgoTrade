@@ -1,0 +1,26 @@
+[
+  {
+    "delta": {
+      "type": "funding",
+      "coin": "BTC",
+      "usdc": "-0.001250",
+      "szi": "0.00045",
+      "fundingRate": "0.000100",
+      "nSamples": null
+    },
+    "hash": "0x1234567890abcdef",
+    "time": 1700000000000
+  },
+  {
+    "delta": {
+      "type": "funding",
+      "coin": "BTC",
+      "usdc": "-0.001180",
+      "szi": "0.00045",
+      "fundingRate": "0.000095",
+      "nSamples": null
+    },
+    "hash": "0xabcdef1234567890",
+    "time": 1700003600000
+  }
+]

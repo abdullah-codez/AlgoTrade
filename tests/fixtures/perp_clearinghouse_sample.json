@@ -1,0 +1,30 @@
+{
+  "marginSummary": {
+    "accountValue": "50.000000",
+    "totalMarginUsed": "7.500000",
+    "totalNtlPos": "37.500000",
+    "totalRawUsd": "50.000000"
+  },
+  "crossMaintenanceMarginUsed": "1.875000",
+  "withdrawable": "42.500000",
+  "assetPositions": [
+    {
+      "position": {
+        "coin": "BTC",
+        "szi": "0.00045",
+        "leverage": {
+          "type": "isolated",
+          "value": 5
+        },
+        "entryPx": "83333.33",
+        "positionValue": "37.50",
+        "unrealizedPnl": "0.450000",
+        "returnOnEquity": "0.060000",
+        "liquidationPx": "67000.00",
+        "marginUsed": "7.500000"
+      },
+      "type": "oneWay"
+    }
+  ],
+  "time": 1700000000000
+}
