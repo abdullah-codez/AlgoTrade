@@ -915,8 +915,9 @@ body {
   font-weight: 500;
 }
 
-/* Capital PnL Strip */
-.capital-pnl-strip {
+/* Capital & Account Reference Strips */
+.capital-pnl-strip,
+.account-perp-ref-strip {
   display: flex;
   align-items: center;
   justify-content: space-between;

@@ -1325,3 +1325,74 @@ async fn test_regression_candle_broadcast_subscription_and_no_mark_mutation() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_api_account_unified_usdc_with_zero_perp_equity_and_failure_handling() {
+    // 1. Setup mock client where perpetual clearinghouse equity is zero ($0.00),
+    // but spot clearinghouse contains positive USDC ($463.704600 total, $2.500000 hold).
+    let mock_client = Arc::new(MockExchangeClient::new("BTC", SignedUsd::zero()));
+    mock_client
+        .set_spot_balance(
+            SignedUsd::new(dec!(463.704600)),
+            SignedUsd::new(dec!(2.500000)),
+        )
+        .await;
+
+    let (orch, _state_file) =
+        create_test_orchestrator(EngineConfig::normal_default(), mock_client.clone());
+    let app = create_router(Arc::new(AppState { orchestrator: orch }), "web");
+
+    // 2. Query GET /api/account
+    let req = Request::builder()
+        .uri("/api/account")
+        .header(header::HOST, "127.0.0.1:3000")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(res.into_body(), 10240).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["success"], true);
+    // Verify perp account value is 0, but unified USDC is positive
+    let acct_val: Decimal = body["data"]["account_value"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(acct_val, Decimal::ZERO);
+    assert_eq!(body["data"]["unified_usdc_total"], "463.704600");
+    assert_eq!(body["data"]["unified_usdc_hold"], "2.500000");
+    assert_eq!(body["data"]["unified_usdc_available"], "461.204600");
+    assert_eq!(body["data"]["unified_account"]["usdc_total"], "463.704600");
+    assert_eq!(body["data"]["unified_account"]["usdc_hold"], "2.500000");
+    assert_eq!(
+        body["data"]["unified_account"]["usdc_available"],
+        "461.204600"
+    );
+
+    // 3. API Failure handling: When spot clearinghouse query fails, /api/account returns 503 SERVICE_UNAVAILABLE
+    // and never silently substitutes mock or zero values.
+    mock_client.set_spot_error(true);
+
+    let req_fail = Request::builder()
+        .uri("/api/account")
+        .header(header::HOST, "127.0.0.1:3000")
+        .body(Body::empty())
+        .unwrap();
+
+    let res_fail = app.oneshot(req_fail).await.unwrap();
+    assert_eq!(res_fail.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let bytes_fail = axum::body::to_bytes(res_fail.into_body(), 10240)
+        .await
+        .unwrap();
+    let body_fail: serde_json::Value = serde_json::from_slice(&bytes_fail).unwrap();
+    assert_eq!(body_fail["success"], false);
+    assert!(body_fail["error"]
+        .as_str()
+        .unwrap()
+        .contains("Simulated spot clearinghouse error"));
+}

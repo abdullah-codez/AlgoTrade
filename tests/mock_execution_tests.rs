@@ -948,3 +948,176 @@ fn test_clearinghouse_required_fields_parsing_and_zero_balance_preservation() {
         matches!(err, Err(ExecutionError::DataParsing(msg)) if msg.contains("Malformed decimal"))
     );
 }
+
+// ============================================================================
+// 12. Spot Clearinghouse State & Unified Account Tests
+// ============================================================================
+
+#[test]
+fn test_fixture_parsing_spot_clearinghouse() {
+    let json_str = include_str!("fixtures/spot_clearinghouse_sample.json");
+    let val: serde_json::Value = serde_json::from_str(json_str).expect("Valid JSON fixture");
+
+    let summary = HyperliquidClient::parse_spot_clearinghouse_state(&val)
+        .expect("Should parse spot clearinghouse state successfully");
+
+    assert_eq!(summary.usdc_total.value(), dec!(463.704600));
+    assert_eq!(summary.usdc_hold.value(), dec!(2.500000));
+    assert_eq!(summary.usdc_available.value(), dec!(461.204600));
+}
+
+#[test]
+fn test_spot_clearinghouse_genuine_zero_balances() {
+    let val = json!({
+        "balances": [
+            {
+                "coin": "USDC",
+                "token": 0,
+                "hold": "0.0",
+                "total": "0.0",
+                "entryNtl": "0.0"
+            }
+        ]
+    });
+
+    let summary = HyperliquidClient::parse_spot_clearinghouse_state(&val)
+        .expect("Genuine zero balances must parse successfully");
+
+    assert_eq!(summary.usdc_total.value(), Decimal::ZERO);
+    assert_eq!(summary.usdc_hold.value(), Decimal::ZERO);
+    assert_eq!(summary.usdc_available.value(), Decimal::ZERO);
+}
+
+#[test]
+fn test_spot_clearinghouse_missing_usdc_entry() {
+    let val = json!({
+        "balances": [
+            {
+                "coin": "PURR",
+                "token": 1,
+                "hold": "0.0",
+                "total": "2000.0",
+                "entryNtl": "1234.56"
+            }
+        ]
+    });
+
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&val)
+        .expect_err("Missing USDC balance entry must return error");
+
+    assert!(
+        matches!(err, ExecutionError::DataParsing(msg) if msg.contains("Missing 'USDC' balance entry"))
+    );
+}
+
+#[test]
+fn test_spot_clearinghouse_malformed_responses() {
+    // 1. Missing balances array
+    let missing_balances = json!({
+        "otherField": "123"
+    });
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&missing_balances).unwrap_err();
+    assert!(matches!(err, ExecutionError::DataParsing(msg) if msg.contains("balances")));
+
+    // 2. Balances is not array
+    let non_array_balances = json!({
+        "balances": "not an array"
+    });
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&non_array_balances).unwrap_err();
+    assert!(matches!(err, ExecutionError::DataParsing(msg) if msg.contains("balances")));
+
+    // 3. Total missing from USDC entry
+    let missing_total = json!({
+        "balances": [
+            {
+                "coin": "USDC",
+                "hold": "0.0"
+            }
+        ]
+    });
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&missing_total).unwrap_err();
+    assert!(matches!(err, ExecutionError::DataParsing(msg) if msg.contains("total")));
+
+    // 4. Malformed total decimal
+    let malformed_total = json!({
+        "balances": [
+            {
+                "coin": "USDC",
+                "total": "not_a_decimal",
+                "hold": "0.0"
+            }
+        ]
+    });
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&malformed_total).unwrap_err();
+    assert!(matches!(err, ExecutionError::DataParsing(msg) if msg.contains("Malformed decimal")));
+
+    // 5. Malformed hold decimal
+    let malformed_hold = json!({
+        "balances": [
+            {
+                "coin": "USDC",
+                "total": "100.0",
+                "hold": "invalid_decimal"
+            }
+        ]
+    });
+    let err = HyperliquidClient::parse_spot_clearinghouse_state(&malformed_hold).unwrap_err();
+    assert!(matches!(err, ExecutionError::DataParsing(msg) if msg.contains("Malformed decimal")));
+}
+
+#[tokio::test]
+async fn test_mock_spot_clearinghouse_and_perp_account_summary() {
+    let mock = MockExchangeClient::new("BTC", SignedUsd::new(dec!(100.0)));
+
+    // Verify initial mock spot balance matches initial_balance
+    let initial_spot = mock
+        .get_spot_clearinghouse_state(TEST_ACCOUNT_ADDRESS)
+        .await
+        .expect("Mock spot state should be available");
+    assert_eq!(initial_spot.usdc_total.value(), dec!(100.0));
+    assert_eq!(initial_spot.usdc_hold.value(), dec!(0.0));
+    assert_eq!(initial_spot.usdc_available.value(), dec!(100.0));
+
+    // Custom spot balance
+    mock.set_spot_balance(SignedUsd::new(dec!(463.7046)), SignedUsd::new(dec!(2.5)))
+        .await;
+    let spot = mock
+        .get_spot_clearinghouse_state(TEST_ACCOUNT_ADDRESS)
+        .await
+        .unwrap();
+    assert_eq!(spot.usdc_total.value(), dec!(463.7046));
+    assert_eq!(spot.usdc_hold.value(), dec!(2.5));
+    assert_eq!(spot.usdc_available.value(), dec!(461.2046));
+
+    // Check that get_perp_account_summary reflects unified balance
+    let summary = mock
+        .get_perp_account_summary(TEST_ACCOUNT_ADDRESS)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.unified_usdc_total,
+        Some(SignedUsd::new(dec!(463.7046)))
+    );
+    assert_eq!(summary.unified_usdc_hold, Some(SignedUsd::new(dec!(2.5))));
+    assert_eq!(
+        summary.unified_usdc_available,
+        Some(SignedUsd::new(dec!(461.2046)))
+    );
+    assert_eq!(
+        summary.unified_account,
+        Some(algo_trade::execution::client::UnifiedAccountSummary {
+            usdc_total: SignedUsd::new(dec!(463.7046)),
+            usdc_hold: SignedUsd::new(dec!(2.5)),
+            usdc_available: SignedUsd::new(dec!(461.2046)),
+        })
+    );
+
+    // Verify simulated spot error
+    mock.set_spot_error(true);
+    let spot_err = mock
+        .get_spot_clearinghouse_state(TEST_ACCOUNT_ADDRESS)
+        .await;
+    assert!(spot_err.is_err());
+    let perp_err = mock.get_perp_account_summary(TEST_ACCOUNT_ADDRESS).await;
+    assert!(perp_err.is_err());
+}

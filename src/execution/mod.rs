@@ -17,6 +17,6 @@ pub mod signing;
 pub use client::{
     shorten_address, validate_candle_interval, CandleSnapshot, ExchangeClient, ExecutionError,
     HyperliquidClient, OrderPlacementResult, OrderRequest, OrderTypeSpec, PerpAccountSummary,
-    SignerStatus,
+    SignerStatus, UnifiedAccountSummary,
 };
 pub use mock::MockExchangeClient;

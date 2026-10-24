@@ -115,36 +115,47 @@
       <section id="cockpit-view" class="view-panel active">
         <!-- TOP ROW: PANELS 1 & 2 -->
         <div class="grid-layout grid-2-col">
-          <!-- PANEL 1: ACCOUNT OVERVIEW (HYPERLIQUID PERPETUALS) -->
+          <!-- PANEL 1: ACCOUNT OVERVIEW (HYPERLIQUID UNIFIED ACCOUNT) -->
           <div class="glass-card">
             <div class="card-header">
               <div class="header-title-group">
                 <h2>1. Account Overview</h2>
-                <span class="card-caption">Hyperliquid Testnet Perpetual Clearinghouse</span>
+                <span class="card-caption">Hyperliquid Testnet Unified Account (Spot &amp; Perps)</span>
               </div>
               <span class="badge-tag" id="acc-signer-badge">Signer Active</span>
             </div>
 
             <div class="metrics-subgrid">
               <div class="stat-box">
-                <span class="stat-label">Perpetual Equity</span>
-                <span class="stat-value font-mono text-accent" id="acc-equity">$0.00 USDC</span>
-                <span class="stat-sub">Total account value</span>
+                <span class="stat-label">Unified USDC Balance</span>
+                <span class="stat-value font-mono text-accent" id="acc-unified-usdc">$0.00 USDC</span>
+                <span class="stat-sub">Spot clearinghouse total</span>
               </div>
               <div class="stat-box">
-                <span class="stat-label">Withdrawable Collateral</span>
-                <span class="stat-value font-mono text-success" id="acc-withdrawable">$0.00 USDC</span>
-                <span class="stat-sub">Available margin buffer</span>
+                <span class="stat-label">Held In Orders</span>
+                <span class="stat-value font-mono text-warning" id="acc-unified-hold">$0.00 USDC</span>
+                <span class="stat-sub">Spot reservation hold</span>
               </div>
               <div class="stat-box">
-                <span class="stat-label">Exchange Margin Used</span>
+                <span class="stat-label">Perp Margin Used</span>
                 <span class="stat-value font-mono" id="acc-margin-used">$0.00 USDC</span>
-                <span class="stat-sub">Committed on exchange</span>
+                <span class="stat-sub">Committed on perp exchange</span>
               </div>
               <div class="stat-box">
-                <span class="stat-label">Exchange Open Pos. P&amp;L</span>
+                <span class="stat-label">Open Position P&amp;L</span>
                 <span class="stat-value font-mono" id="acc-unrealized-pnl">$0.00 USDC</span>
-                <span class="stat-sub" id="acc-open-pos-desc">No open position</span>
+                <span class="stat-sub" id="acc-open-pos-desc">Exchange position flat</span>
+              </div>
+            </div>
+
+            <div class="account-perp-ref-strip">
+              <div class="pnl-strip-item">
+                <span class="strip-label">Perp DEX Equity:</span>
+                <span class="strip-value font-mono text-accent" id="acc-equity">$0.00 USDC</span>
+              </div>
+              <div class="pnl-strip-item">
+                <span class="strip-label">Perp Margin Buffer:</span>
+                <span class="strip-value font-mono text-success" id="acc-withdrawable">$0.00 USDC</span>
               </div>
             </div>
 

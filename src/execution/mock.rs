@@ -6,7 +6,7 @@ use crate::config::MarketMetadata;
 use crate::execution::client::{
     CandleSnapshot, ExchangeClient, ExchangeOpenOrder, ExecutionError, OrderPlacementResult,
     OrderRequest, OrderTypeSpec, PerpAccountSummary, PositionSummary, SignerStatus,
-    UserStateSummary,
+    UnifiedAccountSummary, UserStateSummary,
 };
 use crate::ledger::FundingRecord;
 use crate::types::{Price, Quantity, Side, SignedUsd};
@@ -38,6 +38,8 @@ pub struct MockExchangeState {
     pub funding_history: Vec<FundingRecord>,
     pub leverage: (bool, u32), // (is_cross, leverage)
     pub current_mark_price: Option<Price>,
+    pub spot_usdc_total: Option<SignedUsd>,
+    pub spot_usdc_hold: Option<SignedUsd>,
 }
 
 /// Thread-safe mock exchange client for deterministic integration testing.
@@ -50,6 +52,7 @@ pub struct MockExchangeClient {
     simulate_order_rejection: Arc<AtomicBool>,
     simulate_lost_response: Arc<AtomicBool>,
     simulate_leverage_failure: Arc<AtomicBool>,
+    simulate_spot_error: Arc<AtomicBool>,
     fill_mode: Arc<Mutex<MockFillMode>>,
     trigger_slippage_pct: Arc<Mutex<Decimal>>, // e.g. 0.10 for 10% slippage
     next_oid: Arc<AtomicU64>,
@@ -73,6 +76,8 @@ impl MockExchangeClient {
             funding_history: Vec::new(),
             leverage: (true, 5),
             current_mark_price: None,
+            spot_usdc_total: Some(initial_balance),
+            spot_usdc_hold: Some(SignedUsd::zero()),
         };
 
         Self {
@@ -83,6 +88,7 @@ impl MockExchangeClient {
             simulate_order_rejection: Arc::new(AtomicBool::new(false)),
             simulate_lost_response: Arc::new(AtomicBool::new(false)),
             simulate_leverage_failure: Arc::new(AtomicBool::new(false)),
+            simulate_spot_error: Arc::new(AtomicBool::new(false)),
             fill_mode: Arc::new(Mutex::new(MockFillMode::Resting)),
             trigger_slippage_pct: Arc::new(Mutex::new(dec!(0.0))),
             next_oid: Arc::new(AtomicU64::new(1000)),
@@ -100,6 +106,22 @@ impl MockExchangeClient {
 
     pub fn set_rate_limit(&self, val: bool) {
         self.simulate_rate_limit.store(val, Ordering::SeqCst);
+    }
+
+    pub fn set_spot_error(&self, val: bool) {
+        self.simulate_spot_error.store(val, Ordering::SeqCst);
+    }
+
+    pub async fn set_spot_balance(&self, total: SignedUsd, hold: SignedUsd) {
+        let mut state = self.state.lock().await;
+        state.spot_usdc_total = Some(total);
+        state.spot_usdc_hold = Some(hold);
+    }
+
+    pub async fn clear_spot_balance(&self) {
+        let mut state = self.state.lock().await;
+        state.spot_usdc_total = None;
+        state.spot_usdc_hold = None;
     }
 
     pub fn set_order_rejection(&self, val: bool) {
@@ -269,13 +291,64 @@ impl ExchangeClient for MockExchangeClient {
         })
     }
 
+    async fn get_spot_clearinghouse_state(
+        &self,
+        _address: &str,
+    ) -> Result<UnifiedAccountSummary, ExecutionError> {
+        self.check_fault_injections()?;
+        if self.simulate_spot_error.load(Ordering::SeqCst) {
+            return Err(ExecutionError::ApiRejection(
+                "Simulated spot clearinghouse error".into(),
+            ));
+        }
+        let state = self.state.lock().await;
+        match (state.spot_usdc_total, state.spot_usdc_hold) {
+            (Some(total), Some(hold)) => {
+                let avail = (total.value() - hold.value()).max(Decimal::ZERO);
+                Ok(UnifiedAccountSummary {
+                    usdc_total: total,
+                    usdc_hold: hold,
+                    usdc_available: SignedUsd::new(avail),
+                })
+            }
+            _ => Err(ExecutionError::DataParsing(
+                "Missing 'USDC' balance entry in spotClearinghouseState".into(),
+            )),
+        }
+    }
+
     async fn get_perp_account_summary(
         &self,
         address: &str,
     ) -> Result<PerpAccountSummary, ExecutionError> {
         self.check_fault_injections()?;
+        if self.simulate_spot_error.load(Ordering::SeqCst) {
+            return Err(ExecutionError::ApiRejection(
+                "Simulated spot clearinghouse error".into(),
+            ));
+        }
         let state = self.state.lock().await;
         let cross_maint = SignedUsd::new(state.total_margin_used.value() * dec!(0.25));
+
+        let (unified_total, unified_hold, unified_avail, unified_acc) =
+            match (state.spot_usdc_total, state.spot_usdc_hold) {
+                (Some(total), Some(hold)) => {
+                    let avail = (total.value() - hold.value()).max(Decimal::ZERO);
+                    let acc = UnifiedAccountSummary {
+                        usdc_total: total,
+                        usdc_hold: hold,
+                        usdc_available: SignedUsd::new(avail),
+                    };
+                    (
+                        Some(total),
+                        Some(hold),
+                        Some(SignedUsd::new(avail)),
+                        Some(acc),
+                    )
+                }
+                _ => (None, None, None, None),
+            };
+
         Ok(PerpAccountSummary {
             account_address: address.to_string(),
             shortened_address: crate::execution::client::shorten_address(address),
@@ -288,6 +361,10 @@ impl ExchangeClient for MockExchangeClient {
             exchange_time_ms: 1700000000000,
             source: "Local Mock Engine".to_string(),
             is_mock: true,
+            unified_usdc_total: unified_total,
+            unified_usdc_hold: unified_hold,
+            unified_usdc_available: unified_avail,
+            unified_account: unified_acc,
         })
     }
 

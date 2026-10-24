@@ -124,9 +124,18 @@ pub enum SignerStatus {
     Unconfigured,
 }
 
+/// Unified account summary representing spot clearinghouse balances (primarily USDC).
+/// Under Hyperliquid account abstraction, account-level collateral and balances reside in spotClearinghouseState.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnifiedAccountSummary {
+    pub usdc_total: SignedUsd,
+    pub usdc_hold: SignedUsd,
+    pub usdc_available: SignedUsd,
+}
+
 /// Perpetual clearinghouse summary returned by GET /api/account.
 /// Scope Notice: Represents the perpetual account view on Hyperliquid.
-/// Must not be interpreted as unified-account collateral when broader account mode is enabled.
+/// When unified account mode is active, unified USDC balance is separately reported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerpAccountSummary {
     pub account_address: String,
@@ -140,6 +149,10 @@ pub struct PerpAccountSummary {
     pub exchange_time_ms: u64,
     pub source: String,
     pub is_mock: bool,
+    pub unified_usdc_total: Option<SignedUsd>,
+    pub unified_usdc_hold: Option<SignedUsd>,
+    pub unified_usdc_available: Option<SignedUsd>,
+    pub unified_account: Option<UnifiedAccountSummary>,
 }
 
 /// Format an address dynamically into shortened form (e.g., 0xB251...7b28).
@@ -167,6 +180,10 @@ pub fn validate_candle_interval(interval: &str) -> Result<(), ExecutionError> {
 pub trait ExchangeClient: Send + Sync {
     async fn get_metadata(&self, coin: &str) -> Result<MarketMetadata, ExecutionError>;
     async fn get_user_state(&self, address: &str) -> Result<UserStateSummary, ExecutionError>;
+    async fn get_spot_clearinghouse_state(
+        &self,
+        address: &str,
+    ) -> Result<UnifiedAccountSummary, ExecutionError>;
     async fn get_perp_account_summary(
         &self,
         address: &str,
@@ -567,6 +584,51 @@ impl HyperliquidClient {
             exchange_time_ms: time_ms,
             source: source.to_string(),
             is_mock,
+            unified_usdc_total: None,
+            unified_usdc_hold: None,
+            unified_usdc_available: None,
+            unified_account: None,
+        })
+    }
+
+    /// Pure parsing method for UnifiedAccountSummary from spotClearinghouseState JSON.
+    ///
+    /// Preserves exact total and hold without floating-point arithmetic.
+    /// Distinguishes genuine zero from missing fields or parsing failures.
+    pub fn parse_spot_clearinghouse_state(
+        data: &serde_json::Value,
+    ) -> Result<UnifiedAccountSummary, ExecutionError> {
+        let balances_arr = data
+            .get("balances")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                ExecutionError::DataParsing(
+                    "Missing required 'balances' array in spotClearinghouseState response".into(),
+                )
+            })?;
+
+        let usdc_entry = balances_arr
+            .iter()
+            .find(|b| {
+                b.get("coin")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("USDC"))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                ExecutionError::DataParsing(
+                    "Missing 'USDC' balance entry in spotClearinghouseState".into(),
+                )
+            })?;
+
+        let total_dec = parse_required_decimal(usdc_entry, "total")?;
+        let hold_dec = parse_required_decimal(usdc_entry, "hold")?;
+        let avail_dec = (total_dec - hold_dec).max(Decimal::ZERO);
+
+        Ok(UnifiedAccountSummary {
+            usdc_total: SignedUsd::new(total_dec),
+            usdc_hold: SignedUsd::new(hold_dec),
+            usdc_available: SignedUsd::new(avail_dec),
         })
     }
 }
@@ -607,12 +669,24 @@ impl ExchangeClient for HyperliquidClient {
         Self::parse_user_state(&data)
     }
 
+    async fn get_spot_clearinghouse_state(
+        &self,
+        address: &str,
+    ) -> Result<UnifiedAccountSummary, ExecutionError> {
+        let payload = json!({"type": "spotClearinghouseState", "user": address});
+        let data = self.post_info(payload).await?;
+        Self::parse_spot_clearinghouse_state(&data)
+    }
+
     async fn get_perp_account_summary(
         &self,
         address: &str,
     ) -> Result<PerpAccountSummary, ExecutionError> {
-        let payload = json!({"type": "clearinghouseState", "user": address});
-        let data = self.post_info(payload).await?;
+        let perp_payload = json!({"type": "clearinghouseState", "user": address});
+        let spot_payload = json!({"type": "spotClearinghouseState", "user": address});
+
+        let (perp_data, spot_data) =
+            tokio::try_join!(self.post_info(perp_payload), self.post_info(spot_payload))?;
 
         let signer_status = if self.signer.is_some() {
             self.verify_signer_authorization().await
@@ -620,13 +694,21 @@ impl ExchangeClient for HyperliquidClient {
             *self.signer_status.read().await
         };
 
-        Self::parse_clearinghouse_summary(
-            &data,
+        let mut summary = Self::parse_clearinghouse_summary(
+            &perp_data,
             address,
             signer_status,
             "Hyperliquid Testnet",
             false,
-        )
+        )?;
+
+        let spot_summary = Self::parse_spot_clearinghouse_state(&spot_data)?;
+        summary.unified_usdc_total = Some(spot_summary.usdc_total);
+        summary.unified_usdc_hold = Some(spot_summary.usdc_hold);
+        summary.unified_usdc_available = Some(spot_summary.usdc_available);
+        summary.unified_account = Some(spot_summary);
+
+        Ok(summary)
     }
 
     async fn get_candle_snapshot(

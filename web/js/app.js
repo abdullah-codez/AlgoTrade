@@ -50,6 +50,8 @@ class AlgoTradeApp {
 
     // Panel 1: Account Overview
     this.accSignerBadge = document.getElementById('acc-signer-badge');
+    this.accUnifiedUsdc = document.getElementById('acc-unified-usdc');
+    this.accUnifiedHold = document.getElementById('acc-unified-hold');
     this.accEquity = document.getElementById('acc-equity');
     this.accWithdrawable = document.getElementById('acc-withdrawable');
     this.accMarginUsed = document.getElementById('acc-margin-used');
@@ -493,14 +495,36 @@ class AlgoTradeApp {
       this.btnApproveProposal.disabled = true;
     }
 
-    // Account metrics with proper domain field names
+    // Unified USDC balance & holds from spotClearinghouseState
+    let hasUnified = false;
+    let unifiedTotal = 0;
+    let unifiedHold = 0;
+
+    if (acc.unified_usdc_total !== undefined && acc.unified_usdc_total !== null) {
+      unifiedTotal = parseFloat(acc.unified_usdc_total);
+      unifiedHold = parseFloat(acc.unified_usdc_hold !== undefined && acc.unified_usdc_hold !== null ? acc.unified_usdc_hold : '0');
+      hasUnified = true;
+    } else if (acc.unified_account && acc.unified_account.usdc_total !== undefined) {
+      unifiedTotal = parseFloat(acc.unified_account.usdc_total);
+      unifiedHold = parseFloat(acc.unified_account.usdc_hold || '0');
+      hasUnified = true;
+    }
+
+    if (this.accUnifiedUsdc) {
+      this.accUnifiedUsdc.textContent = hasUnified ? `$${unifiedTotal.toFixed(2)} USDC` : '--';
+    }
+    if (this.accUnifiedHold) {
+      this.accUnifiedHold.textContent = hasUnified ? `$${unifiedHold.toFixed(2)} USDC` : '--';
+    }
+
+    // Account metrics with proper domain field names (Perpetual clearinghouse state)
     const equity = parseFloat(acc.account_value !== undefined ? acc.account_value : (acc.equity || '0'));
     const withdrawable = parseFloat(acc.withdrawable !== undefined ? acc.withdrawable : (acc.available_balance || '0'));
     const marginUsed = parseFloat(acc.total_margin_used !== undefined ? acc.total_margin_used : (acc.margin_used || '0'));
 
-    this.accEquity.textContent = `$${equity.toFixed(2)} USDC`;
-    this.accWithdrawable.textContent = `$${withdrawable.toFixed(2)} USDC`;
-    this.accMarginUsed.textContent = `$${marginUsed.toFixed(2)} USDC`;
+    if (this.accEquity) this.accEquity.textContent = `$${equity.toFixed(2)} USDC`;
+    if (this.accWithdrawable) this.accWithdrawable.textContent = `$${withdrawable.toFixed(2)} USDC`;
+    if (this.accMarginUsed) this.accMarginUsed.textContent = `$${marginUsed.toFixed(2)} USDC`;
 
     let unrealized = 0;
     let posDesc = 'Exchange position flat';
@@ -531,10 +555,12 @@ class AlgoTradeApp {
     this.signerStatusBadge.className = 'badge-value stopped';
     this.accSignerBadge.textContent = stateLabel;
     this.accSignerBadge.className = 'badge-tag danger';
-    this.accEquity.textContent = '--';
-    this.accWithdrawable.textContent = '--';
-    this.accMarginUsed.textContent = '--';
-    this.accUnrealizedPnl.textContent = '--';
+    if (this.accUnifiedUsdc) this.accUnifiedUsdc.textContent = stateLabel;
+    if (this.accUnifiedHold) this.accUnifiedHold.textContent = '--';
+    if (this.accEquity) this.accEquity.textContent = '--';
+    if (this.accWithdrawable) this.accWithdrawable.textContent = '--';
+    if (this.accMarginUsed) this.accMarginUsed.textContent = '--';
+    if (this.accUnrealizedPnl) this.accUnrealizedPnl.textContent = '--';
     this.accOpenPosDesc.textContent = errMsg || 'Exchange state unavailable';
     this.signerWarningBanner.classList.remove('hidden');
     this.signerWarningTitle.textContent = `Exchange State ${stateLabel}`;
